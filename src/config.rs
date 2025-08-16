@@ -7,22 +7,13 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, info};
 
 /// Complete configuration for git-sync-rs
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default)]
     pub defaults: DefaultConfig,
 
     #[serde(default)]
     pub repositories: Vec<RepositoryConfig>,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            defaults: DefaultConfig::default(),
-            repositories: Vec::new(),
-        }
-    }
 }
 
 /// Default configuration values
@@ -87,12 +78,15 @@ pub struct RepositoryConfig {
 fn default_sync_interval() -> u64 {
     60
 }
+
 fn default_sync_new_files() -> bool {
     true
 }
+
 fn default_commit_message() -> String {
     "changes from {hostname} on {timestamp}".to_string()
 }
+
 fn default_remote() -> String {
     "origin".to_string()
 }
@@ -106,7 +100,7 @@ pub struct ConfigLoader {
 impl ConfigLoader {
     /// Create a new config loader
     pub fn new() -> Self {
-        Self { 
+        Self {
             config_path: None,
             cached_config: std::cell::RefCell::new(None),
         }
@@ -117,14 +111,22 @@ impl ConfigLoader {
         self.config_path = Some(path.as_ref().to_path_buf());
         self
     }
+}
 
+impl Default for ConfigLoader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ConfigLoader {
     /// Load configuration from all sources and merge with correct precedence
     pub fn load(&self) -> Result<Config> {
         // Check cache first
         if let Some(cached) = self.cached_config.borrow().as_ref() {
             return Ok(cached.clone());
         }
-        
+
         // Start with defaults
         let mut config = Config::default();
 
@@ -138,7 +140,7 @@ impl ConfigLoader {
         self.apply_env_vars(&mut config);
 
         // Note: Command-line args are applied in main.rs (highest priority)
-        
+
         // Cache the result
         *self.cached_config.borrow_mut() = Some(config.clone());
 

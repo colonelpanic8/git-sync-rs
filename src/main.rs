@@ -5,9 +5,9 @@ use git_sync_rs::{
     WatchConfig,
 };
 use std::env;
+use std::path::Path;
 use std::process;
 use tracing::{error, info};
-use tracing_subscriber;
 
 #[derive(Parser)]
 #[command(name = "git-sync-rs")]
@@ -166,6 +166,9 @@ async fn run(cli: Cli) -> Result<()> {
         }
     };
 
+    // Ensure the repository exists (clone if needed)
+    ensure_repository_exists(&repo_path)?;
+
     // Load configuration with proper precedence:
     // CLI args > env vars > config file > defaults
     let sync_config = loader.to_sync_config(
@@ -300,6 +303,82 @@ fn init_config(force: bool) -> Result<()> {
 
     println!("Created config file at {:?}", config_path);
     println!("Edit this file to configure your repositories.");
+
+    Ok(())
+}
+
+/// Clone repository if it doesn't exist and GIT_SYNC_REPOSITORY is set
+fn ensure_repository_exists(repo_path: &Path) -> Result<()> {
+    // Check if the directory exists
+    if repo_path.exists() {
+        // Directory exists, check if it's a git repo
+        if repo_path.join(".git").exists() {
+            return Ok(()); // Already a git repository
+        } else {
+            return Err(anyhow::anyhow!(
+                "Directory {:?} exists but is not a git repository",
+                repo_path
+            ));
+        }
+    }
+
+    // Directory doesn't exist, check for GIT_SYNC_REPOSITORY
+    let repo_url = match env::var("GIT_SYNC_REPOSITORY") {
+        Ok(url) => url,
+        Err(_) => {
+            return Err(anyhow::anyhow!(
+                "Directory {:?} does not exist. Set GIT_SYNC_REPOSITORY to clone a repository.",
+                repo_path
+            ));
+        }
+    };
+
+    info!("Cloning repository from {} to {:?}", repo_url, repo_path);
+
+    // Create parent directory if needed
+    if let Some(parent) = repo_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // Clone the repository using git command
+    let output = std::process::Command::new("git")
+        .arg("clone")
+        .arg(&repo_url)
+        .arg(repo_path)
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!("Failed to clone repository: {}", stderr));
+    }
+
+    info!("Successfully cloned repository to {:?}", repo_path);
+
+    // Set up push remote for the current branch (like the original script does)
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .arg("symbolic-ref")
+        .arg("-q")
+        .arg("HEAD")
+        .output()?;
+
+    if output.status.success() {
+        let branch = String::from_utf8_lossy(&output.stdout);
+        let branch = branch.trim().split('/').next_back().unwrap_or("main");
+
+        // Set the pushRemote for the branch
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo_path)
+            .arg("config")
+            .arg("--add")
+            .arg(format!("branch.{}.pushRemote", branch))
+            .arg("origin")
+            .output()?;
+
+        info!("Configured push remote for branch {}", branch);
+    }
 
     Ok(())
 }

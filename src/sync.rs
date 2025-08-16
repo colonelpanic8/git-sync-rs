@@ -343,10 +343,10 @@ impl RepositorySynchronizer {
     /// Fetch from remote
     pub fn fetch(&self) -> Result<()> {
         info!("Fetching from remote: {}", self.config.remote_name);
-        
+
         // Use git command directly as a workaround for SSH issues
         use std::process::Command;
-        
+
         let output = Command::new("git")
             .arg("fetch")
             .arg(&self.config.remote_name)
@@ -354,132 +354,147 @@ impl RepositorySynchronizer {
             .current_dir(&self._repo_path)
             .output()
             .map_err(|e| SyncError::Other(format!("Failed to run git fetch: {}", e)))?;
-        
+
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             error!("Git fetch failed: {}", stderr);
             return Err(SyncError::Other(format!("Git fetch failed: {}", stderr)));
         }
-        
-        info!("Fetch completed successfully from remote: {}", self.config.remote_name);
+
+        info!(
+            "Fetch completed successfully from remote: {}",
+            self.config.remote_name
+        );
         return Ok(());
 
         // Original libgit2 implementation (keeping for reference)
         #[allow(unreachable_code)]
         {
-        let mut remote = self.repo.find_remote(&self.config.remote_name)?;
-        
-        // Log the remote URL for debugging
-        if let Some(url) = remote.url() {
-            debug!("Remote URL: {}", url);
-        }
+            let mut remote = self.repo.find_remote(&self.config.remote_name)?;
 
-        // Prepare callbacks for authentication
-        let mut callbacks = git2::RemoteCallbacks::new();
-        callbacks.credentials(|url, username_from_url, allowed_types| {
-            debug!("Authentication callback: url={}, username={:?}, allowed_types={:?}", 
-                   url, username_from_url, allowed_types);
-            
-            let username = username_from_url.unwrap_or("git");
-            
-            // First try SSH agent
-            debug!("Trying SSH key from agent with username: {}", username);
-            match git2::Cred::ssh_key_from_agent(username) {
-                Ok(cred) => {
-                    debug!("Successfully obtained SSH credentials from agent");
-                    return Ok(cred);
+            // Log the remote URL for debugging
+            if let Some(url) = remote.url() {
+                debug!("Remote URL: {}", url);
+            }
+
+            // Prepare callbacks for authentication
+            let mut callbacks = git2::RemoteCallbacks::new();
+            callbacks.credentials(|url, username_from_url, allowed_types| {
+                debug!(
+                    "Authentication callback: url={}, username={:?}, allowed_types={:?}",
+                    url, username_from_url, allowed_types
+                );
+
+                let username = username_from_url.unwrap_or("git");
+
+                // First try SSH agent
+                debug!("Trying SSH key from agent with username: {}", username);
+                match git2::Cred::ssh_key_from_agent(username) {
+                    Ok(cred) => {
+                        debug!("Successfully obtained SSH credentials from agent");
+                        return Ok(cred);
+                    }
+                    Err(e) => {
+                        debug!("SSH agent failed: {}, trying default SSH key", e);
+                    }
+                }
+
+                // Fallback to default SSH key
+                let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                let ssh_dir = std::path::Path::new(&home).join(".ssh");
+                let private_key = ssh_dir.join("id_rsa");
+                let public_key = ssh_dir.join("id_rsa.pub");
+
+                // Try id_rsa first
+                if private_key.exists() {
+                    debug!("Trying SSH key from {:?}", private_key);
+                    match git2::Cred::ssh_key(username, Some(&public_key), &private_key, None) {
+                        Ok(cred) => {
+                            debug!("Successfully using SSH key from disk");
+                            return Ok(cred);
+                        }
+                        Err(e) => {
+                            debug!("Failed to use id_rsa: {}", e);
+                        }
+                    }
+                }
+
+                // Try id_ed25519
+                let private_key = ssh_dir.join("id_ed25519");
+                let public_key = ssh_dir.join("id_ed25519.pub");
+                if private_key.exists() {
+                    debug!("Trying SSH key from {:?}", private_key);
+                    match git2::Cred::ssh_key(username, Some(&public_key), &private_key, None) {
+                        Ok(cred) => {
+                            debug!("Successfully using ed25519 SSH key from disk");
+                            return Ok(cred);
+                        }
+                        Err(e) => {
+                            debug!("Failed to use id_ed25519: {}", e);
+                        }
+                    }
+                }
+
+                error!("No working SSH authentication method found");
+                Err(git2::Error::from_str(
+                    "No SSH authentication method available",
+                ))
+            });
+
+            // Add progress callback
+            callbacks.transfer_progress(|stats| {
+                debug!(
+                    "Fetch progress: {}/{} objects, {} bytes received",
+                    stats.received_objects(),
+                    stats.total_objects(),
+                    stats.received_bytes()
+                );
+                true
+            });
+
+            let mut fetch_options = git2::FetchOptions::new();
+            fetch_options.remote_callbacks(callbacks);
+
+            // Try to set proxy options from git config
+            let mut proxy_options = git2::ProxyOptions::new();
+            proxy_options.auto();
+            fetch_options.proxy_options(proxy_options);
+
+            debug!("Starting fetch for branch: {}", self.config.branch_name);
+            debug!(
+                "Fetching refspec: refs/heads/{}:refs/remotes/{}/{}",
+                self.config.branch_name, self.config.remote_name, self.config.branch_name
+            );
+
+            // Fetch the branch
+            match remote.fetch(&[&self.config.branch_name], Some(&mut fetch_options), None) {
+                Ok(_) => {
+                    info!(
+                        "Fetch completed successfully from remote: {}",
+                        self.config.remote_name
+                    );
+                    Ok(())
                 }
                 Err(e) => {
-                    debug!("SSH agent failed: {}, trying default SSH key", e);
+                    error!(
+                        "Fetch failed from remote {}: {}",
+                        self.config.remote_name, e
+                    );
+                    Err(e.into())
                 }
             }
-            
-            // Fallback to default SSH key
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-            let ssh_dir = std::path::Path::new(&home).join(".ssh");
-            let private_key = ssh_dir.join("id_rsa");
-            let public_key = ssh_dir.join("id_rsa.pub");
-            
-            // Try id_rsa first
-            if private_key.exists() {
-                debug!("Trying SSH key from {:?}", private_key);
-                match git2::Cred::ssh_key(username, Some(&public_key), &private_key, None) {
-                    Ok(cred) => {
-                        debug!("Successfully using SSH key from disk");
-                        return Ok(cred);
-                    }
-                    Err(e) => {
-                        debug!("Failed to use id_rsa: {}", e);
-                    }
-                }
-            }
-            
-            // Try id_ed25519
-            let private_key = ssh_dir.join("id_ed25519");
-            let public_key = ssh_dir.join("id_ed25519.pub");
-            if private_key.exists() {
-                debug!("Trying SSH key from {:?}", private_key);
-                match git2::Cred::ssh_key(username, Some(&public_key), &private_key, None) {
-                    Ok(cred) => {
-                        debug!("Successfully using ed25519 SSH key from disk");
-                        return Ok(cred);
-                    }
-                    Err(e) => {
-                        debug!("Failed to use id_ed25519: {}", e);
-                    }
-                }
-            }
-            
-            error!("No working SSH authentication method found");
-            Err(git2::Error::from_str("No SSH authentication method available"))
-        });
-
-        // Add progress callback
-        callbacks.transfer_progress(|stats| {
-            debug!(
-                "Fetch progress: {}/{} objects, {} bytes received",
-                stats.received_objects(),
-                stats.total_objects(),
-                stats.received_bytes()
-            );
-            true
-        });
-
-        let mut fetch_options = git2::FetchOptions::new();
-        fetch_options.remote_callbacks(callbacks);
-        
-        // Try to set proxy options from git config
-        let mut proxy_options = git2::ProxyOptions::new();
-        proxy_options.auto();
-        fetch_options.proxy_options(proxy_options);
-
-        debug!("Starting fetch for branch: {}", self.config.branch_name);
-        debug!("Fetching refspec: refs/heads/{}:refs/remotes/{}/{}", 
-               self.config.branch_name, self.config.remote_name, self.config.branch_name);
-        
-        // Fetch the branch
-        match remote.fetch(&[&self.config.branch_name], Some(&mut fetch_options), None) {
-            Ok(_) => {
-                info!("Fetch completed successfully from remote: {}", self.config.remote_name);
-                Ok(())
-            }
-            Err(e) => {
-                error!("Fetch failed from remote {}: {}", self.config.remote_name, e);
-                Err(e.into())
-            }
-        }
         }
     }
 
     /// Push to remote
     pub fn push(&self) -> Result<()> {
         info!("Pushing to remote: {}", self.config.remote_name);
-        
+
         // Use git command directly as a workaround for SSH issues
         use std::process::Command;
-        
+
         let refspec = format!("{}:{}", self.config.branch_name, self.config.branch_name);
-        
+
         let output = Command::new("git")
             .arg("push")
             .arg(&self.config.remote_name)
@@ -487,106 +502,116 @@ impl RepositorySynchronizer {
             .current_dir(&self._repo_path)
             .output()
             .map_err(|e| SyncError::Other(format!("Failed to run git push: {}", e)))?;
-        
+
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             error!("Git push failed: {}", stderr);
             return Err(SyncError::Other(format!("Git push failed: {}", stderr)));
         }
-        
-        info!("Push completed successfully to remote: {}", self.config.remote_name);
+
+        info!(
+            "Push completed successfully to remote: {}",
+            self.config.remote_name
+        );
         return Ok(());
-        
+
         // Original libgit2 implementation (keeping for reference)
         #[allow(unreachable_code)]
         {
-        let mut remote = self.repo.find_remote(&self.config.remote_name)?;
+            let mut remote = self.repo.find_remote(&self.config.remote_name)?;
 
-        // Prepare callbacks for authentication
-        let mut callbacks = git2::RemoteCallbacks::new();
-        callbacks.credentials(|url, username_from_url, allowed_types| {
-            debug!("Authentication callback: url={}, username={:?}, allowed_types={:?}", 
-                   url, username_from_url, allowed_types);
-            
-            let username = username_from_url.unwrap_or("git");
-            
-            // First try SSH agent
-            debug!("Trying SSH key from agent with username: {}", username);
-            match git2::Cred::ssh_key_from_agent(username) {
-                Ok(cred) => {
-                    debug!("Successfully obtained SSH credentials from agent");
-                    return Ok(cred);
+            // Prepare callbacks for authentication
+            let mut callbacks = git2::RemoteCallbacks::new();
+            callbacks.credentials(|url, username_from_url, allowed_types| {
+                debug!(
+                    "Authentication callback: url={}, username={:?}, allowed_types={:?}",
+                    url, username_from_url, allowed_types
+                );
+
+                let username = username_from_url.unwrap_or("git");
+
+                // First try SSH agent
+                debug!("Trying SSH key from agent with username: {}", username);
+                match git2::Cred::ssh_key_from_agent(username) {
+                    Ok(cred) => {
+                        debug!("Successfully obtained SSH credentials from agent");
+                        return Ok(cred);
+                    }
+                    Err(e) => {
+                        debug!("SSH agent failed: {}, trying default SSH key", e);
+                    }
+                }
+
+                // Fallback to default SSH key
+                let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                let ssh_dir = std::path::Path::new(&home).join(".ssh");
+                let private_key = ssh_dir.join("id_rsa");
+                let public_key = ssh_dir.join("id_rsa.pub");
+
+                // Try id_rsa first
+                if private_key.exists() {
+                    debug!("Trying SSH key from {:?}", private_key);
+                    match git2::Cred::ssh_key(username, Some(&public_key), &private_key, None) {
+                        Ok(cred) => {
+                            debug!("Successfully using SSH key from disk");
+                            return Ok(cred);
+                        }
+                        Err(e) => {
+                            debug!("Failed to use id_rsa: {}", e);
+                        }
+                    }
+                }
+
+                // Try id_ed25519
+                let private_key = ssh_dir.join("id_ed25519");
+                let public_key = ssh_dir.join("id_ed25519.pub");
+                if private_key.exists() {
+                    debug!("Trying SSH key from {:?}", private_key);
+                    match git2::Cred::ssh_key(username, Some(&public_key), &private_key, None) {
+                        Ok(cred) => {
+                            debug!("Successfully using ed25519 SSH key from disk");
+                            return Ok(cred);
+                        }
+                        Err(e) => {
+                            debug!("Failed to use id_ed25519: {}", e);
+                        }
+                    }
+                }
+
+                error!("No working SSH authentication method found");
+                Err(git2::Error::from_str(
+                    "No SSH authentication method available",
+                ))
+            });
+
+            let mut push_options = git2::PushOptions::new();
+            push_options.remote_callbacks(callbacks);
+
+            // Try to set proxy options from git config
+            let mut proxy_options = git2::ProxyOptions::new();
+            proxy_options.auto();
+            push_options.proxy_options(proxy_options);
+
+            // Push the branch
+            let refspec = format!(
+                "refs/heads/{}:refs/heads/{}",
+                self.config.branch_name, self.config.branch_name
+            );
+
+            debug!("Pushing refspec: {}", refspec);
+            match remote.push(&[&refspec], Some(&mut push_options)) {
+                Ok(_) => {
+                    info!(
+                        "Push completed successfully to remote: {}",
+                        self.config.remote_name
+                    );
+                    Ok(())
                 }
                 Err(e) => {
-                    debug!("SSH agent failed: {}, trying default SSH key", e);
+                    error!("Push failed to remote {}: {}", self.config.remote_name, e);
+                    Err(e.into())
                 }
             }
-            
-            // Fallback to default SSH key
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-            let ssh_dir = std::path::Path::new(&home).join(".ssh");
-            let private_key = ssh_dir.join("id_rsa");
-            let public_key = ssh_dir.join("id_rsa.pub");
-            
-            // Try id_rsa first
-            if private_key.exists() {
-                debug!("Trying SSH key from {:?}", private_key);
-                match git2::Cred::ssh_key(username, Some(&public_key), &private_key, None) {
-                    Ok(cred) => {
-                        debug!("Successfully using SSH key from disk");
-                        return Ok(cred);
-                    }
-                    Err(e) => {
-                        debug!("Failed to use id_rsa: {}", e);
-                    }
-                }
-            }
-            
-            // Try id_ed25519
-            let private_key = ssh_dir.join("id_ed25519");
-            let public_key = ssh_dir.join("id_ed25519.pub");
-            if private_key.exists() {
-                debug!("Trying SSH key from {:?}", private_key);
-                match git2::Cred::ssh_key(username, Some(&public_key), &private_key, None) {
-                    Ok(cred) => {
-                        debug!("Successfully using ed25519 SSH key from disk");
-                        return Ok(cred);
-                    }
-                    Err(e) => {
-                        debug!("Failed to use id_ed25519: {}", e);
-                    }
-                }
-            }
-            
-            error!("No working SSH authentication method found");
-            Err(git2::Error::from_str("No SSH authentication method available"))
-        });
-
-        let mut push_options = git2::PushOptions::new();
-        push_options.remote_callbacks(callbacks);
-        
-        // Try to set proxy options from git config
-        let mut proxy_options = git2::ProxyOptions::new();
-        proxy_options.auto();
-        push_options.proxy_options(proxy_options);
-
-        // Push the branch
-        let refspec = format!(
-            "refs/heads/{}:refs/heads/{}",
-            self.config.branch_name, self.config.branch_name
-        );
-        
-        debug!("Pushing refspec: {}", refspec);
-        match remote.push(&[&refspec], Some(&mut push_options)) {
-            Ok(_) => {
-                info!("Push completed successfully to remote: {}", self.config.remote_name);
-                Ok(())
-            }
-            Err(e) => {
-                error!("Push failed to remote {}: {}", self.config.remote_name, e);
-                Err(e.into())
-            }
-        }
         }
     }
 
@@ -607,11 +632,17 @@ impl RepositorySynchronizer {
         let mut reference = self.repo.head()?;
         reference.set_target(upstream_oid, "fast-forward merge")?;
 
-        // Checkout the new HEAD
+        // Checkout the new HEAD to update working directory
         let object = self.repo.find_object(upstream_oid, None)?;
-        self.repo.checkout_tree(&object, None)?;
+        let mut checkout_builder = git2::build::CheckoutBuilder::new();
+        checkout_builder.force(); // Force update working directory files
+        self.repo
+            .checkout_tree(&object, Some(&mut checkout_builder))?;
 
-        info!("Fast-forward merge completed");
+        // Update HEAD to point to the new commit
+        self.repo.set_head(&format!("refs/heads/{}", branch_name))?;
+
+        info!("Fast-forward merge completed - working tree updated");
         Ok(())
     }
 
@@ -669,7 +700,15 @@ impl RepositorySynchronizer {
         // Finish the rebase
         rebase.finish(Some(&sig))?;
 
-        info!("Rebase completed successfully");
+        // Ensure working tree is properly updated after rebase
+        let head = self.repo.head()?;
+        let head_commit = head.peel_to_commit()?;
+        let mut checkout_builder = git2::build::CheckoutBuilder::new();
+        checkout_builder.force();
+        self.repo
+            .checkout_tree(head_commit.as_object(), Some(&mut checkout_builder))?;
+
+        info!("Rebase completed successfully - working tree updated");
         Ok(())
     }
 

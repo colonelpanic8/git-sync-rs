@@ -55,7 +55,7 @@ impl WatchManager {
         // Expand tilde in path
         let path_str = repo_path.as_ref().to_string_lossy();
         let expanded = shellexpand::tilde(&path_str).to_string();
-        
+
         Self {
             repo_path: expanded,
             sync_config,
@@ -79,20 +79,20 @@ impl WatchManager {
 
         // Clone repo path for the callback
         let repo_path_clone = PathBuf::from(&self.repo_path);
-        
+
         // Setup file watcher
         let mut watcher = RecommendedWatcher::new(
             move |res: std::result::Result<Event, notify::Error>| {
                 match res {
                     Ok(event) => {
                         debug!("Raw file event received: {:?}", event);
-                        
+
                         // Ignore git directory changes
                         if is_git_internal(&event) {
                             debug!("Ignoring git internal event");
                             return;
                         }
-                        
+
                         // Check gitignore for each path in the event
                         let repo = match Repository::open(&repo_path_clone) {
                             Ok(r) => r,
@@ -101,17 +101,18 @@ impl WatchManager {
                                 return;
                             }
                         };
-                        
+
                         // Check if any path in the event should be ignored
-                        let should_ignore = event.paths.iter().any(|path| {
-                            should_ignore_path(&repo, &repo_path_clone, path)
-                        });
-                        
+                        let should_ignore = event
+                            .paths
+                            .iter()
+                            .any(|path| should_ignore_path(&repo, &repo_path_clone, path));
+
                         if should_ignore {
                             debug!("Ignoring gitignored file event");
                             return;
                         }
-                        
+
                         debug!("Event is relevant, sending to channel");
                         if let Err(e) = tx.blocking_send(event.clone()) {
                             error!("Failed to send event to channel: {}", e);
@@ -213,7 +214,7 @@ impl WatchManager {
         let repo_path = self.repo_path.clone();
         let sync_config = self.sync_config.clone();
 
-        let result = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             // Create synchronizer
             let synchronizer =
                 RepositorySynchronizer::new_with_detected_branch(&repo_path, sync_config)?;
@@ -229,7 +230,7 @@ impl WatchManager {
             *is_syncing = false;
         }
 
-        Ok(result)
+        Ok(())
     }
 }
 
@@ -251,7 +252,7 @@ fn should_ignore_path(repo: &Repository, repo_path: &Path, file_path: &Path) -> 
             return true;
         }
     };
-    
+
     // Check if the path is ignored by git
     match repo.status_should_ignore(relative_path) {
         Ok(ignored) => {
@@ -261,7 +262,10 @@ fn should_ignore_path(repo: &Repository, repo_path: &Path, file_path: &Path) -> 
             ignored
         }
         Err(e) => {
-            debug!("Error checking gitignore status for {:?}: {}", relative_path, e);
+            debug!(
+                "Error checking gitignore status for {:?}: {}",
+                relative_path, e
+            );
             false
         }
     }
@@ -273,12 +277,12 @@ fn is_relevant_change(event: &Event) -> bool {
         event.kind,
         EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
     );
-    
+
     debug!(
         "is_relevant_change: kind={:?}, relevant={}",
         event.kind, is_relevant
     );
-    
+
     is_relevant
 }
 
