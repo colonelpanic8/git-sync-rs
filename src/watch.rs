@@ -45,6 +45,129 @@ pub struct WatchManager {
     is_syncing: Arc<Mutex<bool>>,
 }
 
+/// Event handler for file system changes
+struct FileEventHandler {
+    repo_path: PathBuf,
+    tx: mpsc::Sender<Event>,
+}
+
+impl FileEventHandler {
+    fn new(repo_path: PathBuf, tx: mpsc::Sender<Event>) -> Self {
+        Self { repo_path, tx }
+    }
+
+    fn handle_event(&self, res: std::result::Result<Event, notify::Error>) {
+        let event = match res {
+            Ok(event) => event,
+            Err(e) => {
+                error!("Watch error: {}", e);
+                return;
+            }
+        };
+
+        debug!("Raw file event received: {:?}", event);
+
+        if !self.should_process_event(&event) {
+            return;
+        }
+
+        debug!("Event is relevant, sending to channel");
+        if let Err(e) = self.tx.blocking_send(event.clone()) {
+            error!("Failed to send event to channel: {}", e);
+        } else {
+            debug!("Event sent successfully: {:?}", event.kind);
+        }
+    }
+
+    fn should_process_event(&self, event: &Event) -> bool {
+        // Ignore git directory changes
+        if self.is_git_internal(event) {
+            debug!("Ignoring git internal event");
+            return false;
+        }
+
+        // Open repository for gitignore check
+        let repo = match Repository::open(&self.repo_path) {
+            Ok(r) => r,
+            Err(e) => {
+                error!("Failed to open repository for gitignore check: {}", e);
+                return false;
+            }
+        };
+
+        // Check if any path in the event should be ignored
+        let should_ignore = event
+            .paths
+            .iter()
+            .any(|path| self.should_ignore_path(&repo, path));
+
+        if should_ignore {
+            debug!("Ignoring gitignored file event");
+            return false;
+        }
+
+        // Check if this is a relevant change type
+        if !self.is_relevant_change(event) {
+            debug!("Event not considered relevant: {:?}", event.kind);
+            return false;
+        }
+
+        true
+    }
+
+    /// Check if an event is related to git internals
+    fn is_git_internal(&self, event: &Event) -> bool {
+        event
+            .paths
+            .iter()
+            .any(|path| path.components().any(|c| c.as_os_str() == ".git"))
+    }
+
+    /// Check if a path should be ignored according to gitignore rules
+    fn should_ignore_path(&self, repo: &Repository, file_path: &Path) -> bool {
+        // Make path relative to repo root
+        let relative_path = match file_path.strip_prefix(&self.repo_path) {
+            Ok(p) => p,
+            Err(_) => {
+                debug!("Path {:?} is outside repo, ignoring", file_path);
+                return true;
+            }
+        };
+
+        // Check if the path is ignored by git
+        match repo.status_should_ignore(relative_path) {
+            Ok(ignored) => {
+                if ignored {
+                    debug!("Path {:?} is gitignored", relative_path);
+                }
+                ignored
+            }
+            Err(e) => {
+                debug!(
+                    "Error checking gitignore status for {:?}: {}",
+                    relative_path, e
+                );
+                false
+            }
+        }
+    }
+
+    /// Check if an event represents a relevant change
+    fn is_relevant_change(&self, event: &Event) -> bool {
+        let is_relevant = matches!(
+            event.kind,
+            EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+        );
+
+        debug!(
+            "is_relevant_change: kind={:?}, relevant={}",
+            event.kind, is_relevant
+        );
+
+        is_relevant
+    }
+}
+
 impl WatchManager {
     /// Create a new watch manager
     pub fn new(
@@ -75,117 +198,106 @@ impl WatchManager {
         }
 
         // Create channel for file events
-        let (tx, mut rx) = mpsc::channel::<Event>(100);
-
-        // Clone repo path for the callback
-        let repo_path_clone = PathBuf::from(&self.repo_path);
+        let (tx, rx) = mpsc::channel::<Event>(100);
 
         // Setup file watcher
-        let mut watcher = RecommendedWatcher::new(
-            move |res: std::result::Result<Event, notify::Error>| {
-                match res {
-                    Ok(event) => {
-                        debug!("Raw file event received: {:?}", event);
-
-                        // Ignore git directory changes
-                        if is_git_internal(&event) {
-                            debug!("Ignoring git internal event");
-                            return;
-                        }
-
-                        // Check gitignore for each path in the event
-                        let repo = match Repository::open(&repo_path_clone) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                error!("Failed to open repository for gitignore check: {}", e);
-                                return;
-                            }
-                        };
-
-                        // Check if any path in the event should be ignored
-                        let should_ignore = event
-                            .paths
-                            .iter()
-                            .any(|path| should_ignore_path(&repo, &repo_path_clone, path));
-
-                        if should_ignore {
-                            debug!("Ignoring gitignored file event");
-                            return;
-                        }
-
-                        debug!("Event is relevant, sending to channel");
-                        if let Err(e) = tx.blocking_send(event.clone()) {
-                            error!("Failed to send event to channel: {}", e);
-                        } else {
-                            debug!("Event sent successfully: {:?}", event.kind);
-                        }
-                    }
-                    Err(e) => error!("Watch error: {}", e),
-                }
-            },
-            Config::default(),
-        )?;
-
-        // Watch the repository path
-        watcher.watch(Path::new(&self.repo_path), RecursiveMode::Recursive)?;
+        let _watcher = self.setup_watcher(tx)?;
 
         info!(
             "Watching for changes (debounce: {}s)",
             self.watch_config.debounce_ms as f64 / 1000.0
         );
 
-        // Event processing loop
-        let mut last_sync = time::Instant::now();
-        let mut pending_sync = false;
+        // Process events
+        self.process_events(rx).await
+    }
+
+    /// Setup the file system watcher
+    fn setup_watcher(&self, tx: mpsc::Sender<Event>) -> Result<RecommendedWatcher> {
+        let repo_path_clone = PathBuf::from(&self.repo_path);
+        let handler = FileEventHandler::new(repo_path_clone, tx);
+
+        let mut watcher =
+            RecommendedWatcher::new(move |res| handler.handle_event(res), Config::default())?;
+
+        // Watch the repository path
+        watcher.watch(Path::new(&self.repo_path), RecursiveMode::Recursive)?;
+
+        Ok(watcher)
+    }
+
+    /// Process file system events
+    async fn process_events(&self, mut rx: mpsc::Receiver<Event>) -> Result<()> {
+        let mut sync_state = SyncState::new(
+            self.watch_config.debounce_ms,
+            self.watch_config.min_interval_ms,
+        );
 
         loop {
-            // Wait for events or timeout
             let timeout = time::sleep(Duration::from_millis(self.watch_config.debounce_ms));
             tokio::pin!(timeout);
 
             tokio::select! {
                 Some(event) = rx.recv() => {
-                    debug!("Received event from channel: {:?}", event);
-                    debug!("Event kind: {:?}, paths: {:?}", event.kind, event.paths);
-
-                    // Check if this is a relevant change
-                    if is_relevant_change(&event) {
-                        info!("Relevant change detected, marking pending sync");
-                        pending_sync = true;
-                    } else {
-                        debug!("Event not considered relevant: {:?}", event.kind);
-                    }
+                    self.handle_file_event(event, &mut sync_state);
                 }
                 _ = &mut timeout => {
-                    // Debounce period expired
-                    if pending_sync {
-                        // Check minimum interval
-                        let elapsed = last_sync.elapsed();
-                        let min_interval = Duration::from_millis(self.watch_config.min_interval_ms);
-
-                        if elapsed >= min_interval {
-                            // Check if already syncing
-                            let is_syncing = self.is_syncing.lock().await;
-                            if !*is_syncing {
-                                drop(is_syncing); // Release lock before syncing
-
-                                info!("Changes detected, triggering sync");
-                                if let Err(e) = self.perform_sync().await {
-                                    error!("Sync failed: {}", e);
-                                }
-
-                                last_sync = time::Instant::now();
-                                pending_sync = false;
-                            } else {
-                                debug!("Sync already in progress, skipping");
-                            }
-                        } else {
-                            debug!("Too soon since last sync, waiting");
-                        }
-                    }
+                    self.handle_timeout(&mut sync_state).await;
                 }
             }
         }
+    }
+
+    /// Handle a file system event
+    fn handle_file_event(&self, event: Event, sync_state: &mut SyncState) {
+        debug!("Received event from channel: {:?}", event);
+        debug!("Event kind: {:?}, paths: {:?}", event.kind, event.paths);
+
+        // Use FileEventHandler's method to check relevance
+        // We can't easily share this without restructuring, so for now keep it simple
+        if self.is_relevant_change(&event) {
+            info!("Relevant change detected, marking pending sync");
+            sync_state.mark_pending();
+        } else {
+            debug!("Event not considered relevant: {:?}", event.kind);
+        }
+    }
+
+    /// Check if an event represents a relevant change
+    fn is_relevant_change(&self, event: &Event) -> bool {
+        let is_relevant = matches!(
+            event.kind,
+            EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+        );
+
+        debug!(
+            "is_relevant_change: kind={:?}, relevant={}",
+            event.kind, is_relevant
+        );
+
+        is_relevant
+    }
+
+    /// Handle timeout expiration
+    async fn handle_timeout(&self, sync_state: &mut SyncState) {
+        if !sync_state.should_sync() {
+            return;
+        }
+
+        // Check if already syncing
+        let is_syncing = self.is_syncing.lock().await;
+        if *is_syncing {
+            debug!("Sync already in progress, skipping");
+            return;
+        }
+        drop(is_syncing); // Release lock before syncing
+
+        info!("Changes detected, triggering sync");
+        if let Err(e) = self.perform_sync().await {
+            error!("Sync failed: {}", e);
+        }
+
+        sync_state.record_sync();
     }
 
     /// Perform a synchronization
@@ -234,56 +346,44 @@ impl WatchManager {
     }
 }
 
-/// Check if an event is related to git internals
-fn is_git_internal(event: &Event) -> bool {
-    event
-        .paths
-        .iter()
-        .any(|path| path.components().any(|c| c.as_os_str() == ".git"))
+/// State for managing sync timing
+struct SyncState {
+    last_sync: time::Instant,
+    pending_sync: bool,
+    min_interval: Duration,
 }
 
-/// Check if a path should be ignored according to gitignore rules
-fn should_ignore_path(repo: &Repository, repo_path: &Path, file_path: &Path) -> bool {
-    // Make path relative to repo root
-    let relative_path = match file_path.strip_prefix(repo_path) {
-        Ok(p) => p,
-        Err(_) => {
-            debug!("Path {:?} is outside repo, ignoring", file_path);
-            return true;
-        }
-    };
-
-    // Check if the path is ignored by git
-    match repo.status_should_ignore(relative_path) {
-        Ok(ignored) => {
-            if ignored {
-                debug!("Path {:?} is gitignored", relative_path);
-            }
-            ignored
-        }
-        Err(e) => {
-            debug!(
-                "Error checking gitignore status for {:?}: {}",
-                relative_path, e
-            );
-            false
+impl SyncState {
+    fn new(_debounce_ms: u64, min_interval_ms: u64) -> Self {
+        Self {
+            last_sync: time::Instant::now(),
+            pending_sync: false,
+            min_interval: Duration::from_millis(min_interval_ms),
         }
     }
-}
 
-/// Check if an event represents a relevant change
-fn is_relevant_change(event: &Event) -> bool {
-    let is_relevant = matches!(
-        event.kind,
-        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-    );
+    fn mark_pending(&mut self) {
+        self.pending_sync = true;
+    }
 
-    debug!(
-        "is_relevant_change: kind={:?}, relevant={}",
-        event.kind, is_relevant
-    );
+    fn should_sync(&self) -> bool {
+        if !self.pending_sync {
+            return false;
+        }
 
-    is_relevant
+        let elapsed = self.last_sync.elapsed();
+        if elapsed < self.min_interval {
+            debug!("Too soon since last sync, waiting");
+            return false;
+        }
+
+        true
+    }
+
+    fn record_sync(&mut self) {
+        self.last_sync = time::Instant::now();
+        self.pending_sync = false;
+    }
 }
 
 /// Run watch mode with periodic sync
