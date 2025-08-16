@@ -29,10 +29,6 @@ struct Cli {
     #[arg(short = 'n', long, global = true)]
     new_files: Option<bool>,
 
-    /// Force sync even if not configured (compatible with original git-sync -s flag)
-    #[arg(short = 's', long, global = true)]
-    sync_anyway: bool,
-
     /// Dry run mode - detect changes but don't sync (for default watch mode)
     #[arg(long, global = true)]
     dry_run: bool,

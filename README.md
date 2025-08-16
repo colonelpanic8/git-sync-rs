@@ -95,7 +95,6 @@ remote_name = "backup"
 ## Command Line Options
 
 - `-n, --new-files` - Sync new/untracked files
-- `-s, --sync-anyway` - Force sync even if not configured
 - `-r, --remote <name>` - Specify remote name
 - `-d, --directory <path>` - Repository path
 - `-v, --verbose` - Enable verbose output
