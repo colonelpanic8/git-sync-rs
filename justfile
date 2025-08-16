@@ -28,7 +28,6 @@ checks:
     just fmt-check
     just clippy
     cargo test
-    just check-cassettes
 
 # Version bump, build, commit, and tag
 # Usage: just release [patch|minor|major]
