@@ -2,6 +2,14 @@
 name = "git-sync-rs"
 version = "0.1.2"
 edition = "2021"
+description = "Automatic git repository synchronization with file watching"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/colonelpanic8/git-sync-rs"
+homepage = "https://github.com/colonelpanic8/git-sync-rs"
+readme = "README.md"
+keywords = ["git", "sync", "watch", "auto-commit", "backup"]
+categories = ["command-line-utilities", "development-tools"]
+authors = ["Ivan Malison <IvanMalison@gmail.com>"]
 
 [dependencies]
 git2 = "0.18"
