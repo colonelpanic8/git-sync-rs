@@ -1,5 +1,11 @@
 # git-sync-rs
 
+[![CI](https://github.com/colonelpanic8/git-sync-rs/workflows/CI/badge.svg)](https://github.com/colonelpanic8/git-sync-rs/actions)
+[![Crates.io](https://img.shields.io/crates/v/git-sync-rs.svg)](https://crates.io/crates/git-sync-rs)
+[![Documentation](https://docs.rs/git-sync-rs/badge.svg)](https://docs.rs/git-sync-rs)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+
 A Rust implementation of automatic git repository synchronization with file watching capabilities. This tool automatically commits, pushes, and pulls changes to keep your repositories in sync.
 
 ## Features
