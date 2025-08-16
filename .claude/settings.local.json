@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo:*)",
+      "Bash(direnv allow:*)",
+      "Bash(echo $OPENSSL_DIR)"
+    ],
+    "deny": []
+  }
+}

@@ -1,0 +1,13 @@
+[package]
+name = "git-sync-rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+git2 = "0.18"
+anyhow = "1.0"
+thiserror = "1.0"
+chrono = "0.4"
+hostname = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
