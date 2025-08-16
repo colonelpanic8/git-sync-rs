@@ -2,7 +2,7 @@ use crate::error::{Result, SyncError};
 use chrono::Local;
 use git2::{BranchType, Repository, Status, StatusOptions};
 use std::path::{Path, PathBuf};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Configuration for the synchronizer
 #[derive(Debug, Clone)]
@@ -26,7 +26,7 @@ pub struct SyncConfig {
 impl Default for SyncConfig {
     fn default() -> Self {
         Self {
-            sync_new_files: false,
+            sync_new_files: true, // Default to syncing untracked files
             skip_hooks: false,
             commit_message: None,
             remote_name: "origin".to_string(),
@@ -87,12 +87,6 @@ pub enum SyncState {
 pub enum UnhandledFileState {
     /// File has merge conflicts
     Conflicted { path: String },
-    
-    /// File has staged changes
-    Staged { path: String },
-    
-    /// File is untracked and sync_new_files is false
-    Untracked { path: String },
 }
 
 /// Main synchronizer struct
@@ -106,7 +100,9 @@ impl RepositorySynchronizer {
     /// Create a new synchronizer for the given repository path
     pub fn new(repo_path: impl AsRef<Path>, config: SyncConfig) -> Result<Self> {
         let repo_path = repo_path.as_ref().to_path_buf();
-        let repo = Repository::open(&repo_path).map_err(|_| SyncError::NotARepository)?;
+        let repo = Repository::open(&repo_path).map_err(|_| SyncError::NotARepository {
+            path: repo_path.display().to_string(),
+        })?;
 
         Ok(Self {
             repo,
@@ -116,10 +112,15 @@ impl RepositorySynchronizer {
     }
 
     /// Create a new synchronizer with auto-detected branch name
-    pub fn new_with_detected_branch(repo_path: impl AsRef<Path>, mut config: SyncConfig) -> Result<Self> {
+    pub fn new_with_detected_branch(
+        repo_path: impl AsRef<Path>,
+        mut config: SyncConfig,
+    ) -> Result<Self> {
         let repo_path = repo_path.as_ref().to_path_buf();
-        let repo = Repository::open(&repo_path).map_err(|_| SyncError::NotARepository)?;
-        
+        let repo = Repository::open(&repo_path).map_err(|_| SyncError::NotARepository {
+            path: repo_path.display().to_string(),
+        })?;
+
         // Try to detect current branch
         if let Ok(head) = repo.head() {
             if head.is_branch() {
@@ -224,16 +225,6 @@ impl RepositorySynchronizer {
             // Check for conflicted files
             if status.is_conflicted() {
                 return Ok(Some(UnhandledFileState::Conflicted { path }));
-            }
-
-            // Check for staged changes
-            if status.is_index_new() || status.is_index_modified() || status.is_index_deleted() {
-                return Ok(Some(UnhandledFileState::Staged { path }));
-            }
-
-            // If not syncing new files, check for untracked files
-            if !self.config.sync_new_files && status.is_wt_new() {
-                return Ok(Some(UnhandledFileState::Untracked { path }));
             }
         }
 
@@ -352,47 +343,251 @@ impl RepositorySynchronizer {
     /// Fetch from remote
     pub fn fetch(&self) -> Result<()> {
         info!("Fetching from remote: {}", self.config.remote_name);
+        
+        // Use git command directly as a workaround for SSH issues
+        use std::process::Command;
+        
+        let output = Command::new("git")
+            .arg("fetch")
+            .arg(&self.config.remote_name)
+            .arg(&self.config.branch_name)
+            .current_dir(&self._repo_path)
+            .output()
+            .map_err(|e| SyncError::Other(format!("Failed to run git fetch: {}", e)))?;
+        
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            error!("Git fetch failed: {}", stderr);
+            return Err(SyncError::Other(format!("Git fetch failed: {}", stderr)));
+        }
+        
+        info!("Fetch completed successfully from remote: {}", self.config.remote_name);
+        return Ok(());
 
+        // Original libgit2 implementation (keeping for reference)
+        #[allow(unreachable_code)]
+        {
         let mut remote = self.repo.find_remote(&self.config.remote_name)?;
+        
+        // Log the remote URL for debugging
+        if let Some(url) = remote.url() {
+            debug!("Remote URL: {}", url);
+        }
 
         // Prepare callbacks for authentication
         let mut callbacks = git2::RemoteCallbacks::new();
-        callbacks.credentials(|_url, username_from_url, _allowed_types| {
-            git2::Cred::ssh_key_from_agent(username_from_url.unwrap_or("git"))
+        callbacks.credentials(|url, username_from_url, allowed_types| {
+            debug!("Authentication callback: url={}, username={:?}, allowed_types={:?}", 
+                   url, username_from_url, allowed_types);
+            
+            let username = username_from_url.unwrap_or("git");
+            
+            // First try SSH agent
+            debug!("Trying SSH key from agent with username: {}", username);
+            match git2::Cred::ssh_key_from_agent(username) {
+                Ok(cred) => {
+                    debug!("Successfully obtained SSH credentials from agent");
+                    return Ok(cred);
+                }
+                Err(e) => {
+                    debug!("SSH agent failed: {}, trying default SSH key", e);
+                }
+            }
+            
+            // Fallback to default SSH key
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            let ssh_dir = std::path::Path::new(&home).join(".ssh");
+            let private_key = ssh_dir.join("id_rsa");
+            let public_key = ssh_dir.join("id_rsa.pub");
+            
+            // Try id_rsa first
+            if private_key.exists() {
+                debug!("Trying SSH key from {:?}", private_key);
+                match git2::Cred::ssh_key(username, Some(&public_key), &private_key, None) {
+                    Ok(cred) => {
+                        debug!("Successfully using SSH key from disk");
+                        return Ok(cred);
+                    }
+                    Err(e) => {
+                        debug!("Failed to use id_rsa: {}", e);
+                    }
+                }
+            }
+            
+            // Try id_ed25519
+            let private_key = ssh_dir.join("id_ed25519");
+            let public_key = ssh_dir.join("id_ed25519.pub");
+            if private_key.exists() {
+                debug!("Trying SSH key from {:?}", private_key);
+                match git2::Cred::ssh_key(username, Some(&public_key), &private_key, None) {
+                    Ok(cred) => {
+                        debug!("Successfully using ed25519 SSH key from disk");
+                        return Ok(cred);
+                    }
+                    Err(e) => {
+                        debug!("Failed to use id_ed25519: {}", e);
+                    }
+                }
+            }
+            
+            error!("No working SSH authentication method found");
+            Err(git2::Error::from_str("No SSH authentication method available"))
+        });
+
+        // Add progress callback
+        callbacks.transfer_progress(|stats| {
+            debug!(
+                "Fetch progress: {}/{} objects, {} bytes received",
+                stats.received_objects(),
+                stats.total_objects(),
+                stats.received_bytes()
+            );
+            true
         });
 
         let mut fetch_options = git2::FetchOptions::new();
         fetch_options.remote_callbacks(callbacks);
+        
+        // Try to set proxy options from git config
+        let mut proxy_options = git2::ProxyOptions::new();
+        proxy_options.auto();
+        fetch_options.proxy_options(proxy_options);
 
+        debug!("Starting fetch for branch: {}", self.config.branch_name);
+        debug!("Fetching refspec: refs/heads/{}:refs/remotes/{}/{}", 
+               self.config.branch_name, self.config.remote_name, self.config.branch_name);
+        
         // Fetch the branch
-        remote.fetch(&[&self.config.branch_name], Some(&mut fetch_options), None)?;
-
-        Ok(())
+        match remote.fetch(&[&self.config.branch_name], Some(&mut fetch_options), None) {
+            Ok(_) => {
+                info!("Fetch completed successfully from remote: {}", self.config.remote_name);
+                Ok(())
+            }
+            Err(e) => {
+                error!("Fetch failed from remote {}: {}", self.config.remote_name, e);
+                Err(e.into())
+            }
+        }
+        }
     }
 
     /// Push to remote
     pub fn push(&self) -> Result<()> {
         info!("Pushing to remote: {}", self.config.remote_name);
-
+        
+        // Use git command directly as a workaround for SSH issues
+        use std::process::Command;
+        
+        let refspec = format!("{}:{}", self.config.branch_name, self.config.branch_name);
+        
+        let output = Command::new("git")
+            .arg("push")
+            .arg(&self.config.remote_name)
+            .arg(&refspec)
+            .current_dir(&self._repo_path)
+            .output()
+            .map_err(|e| SyncError::Other(format!("Failed to run git push: {}", e)))?;
+        
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            error!("Git push failed: {}", stderr);
+            return Err(SyncError::Other(format!("Git push failed: {}", stderr)));
+        }
+        
+        info!("Push completed successfully to remote: {}", self.config.remote_name);
+        return Ok(());
+        
+        // Original libgit2 implementation (keeping for reference)
+        #[allow(unreachable_code)]
+        {
         let mut remote = self.repo.find_remote(&self.config.remote_name)?;
 
         // Prepare callbacks for authentication
         let mut callbacks = git2::RemoteCallbacks::new();
-        callbacks.credentials(|_url, username_from_url, _allowed_types| {
-            git2::Cred::ssh_key_from_agent(username_from_url.unwrap_or("git"))
+        callbacks.credentials(|url, username_from_url, allowed_types| {
+            debug!("Authentication callback: url={}, username={:?}, allowed_types={:?}", 
+                   url, username_from_url, allowed_types);
+            
+            let username = username_from_url.unwrap_or("git");
+            
+            // First try SSH agent
+            debug!("Trying SSH key from agent with username: {}", username);
+            match git2::Cred::ssh_key_from_agent(username) {
+                Ok(cred) => {
+                    debug!("Successfully obtained SSH credentials from agent");
+                    return Ok(cred);
+                }
+                Err(e) => {
+                    debug!("SSH agent failed: {}, trying default SSH key", e);
+                }
+            }
+            
+            // Fallback to default SSH key
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            let ssh_dir = std::path::Path::new(&home).join(".ssh");
+            let private_key = ssh_dir.join("id_rsa");
+            let public_key = ssh_dir.join("id_rsa.pub");
+            
+            // Try id_rsa first
+            if private_key.exists() {
+                debug!("Trying SSH key from {:?}", private_key);
+                match git2::Cred::ssh_key(username, Some(&public_key), &private_key, None) {
+                    Ok(cred) => {
+                        debug!("Successfully using SSH key from disk");
+                        return Ok(cred);
+                    }
+                    Err(e) => {
+                        debug!("Failed to use id_rsa: {}", e);
+                    }
+                }
+            }
+            
+            // Try id_ed25519
+            let private_key = ssh_dir.join("id_ed25519");
+            let public_key = ssh_dir.join("id_ed25519.pub");
+            if private_key.exists() {
+                debug!("Trying SSH key from {:?}", private_key);
+                match git2::Cred::ssh_key(username, Some(&public_key), &private_key, None) {
+                    Ok(cred) => {
+                        debug!("Successfully using ed25519 SSH key from disk");
+                        return Ok(cred);
+                    }
+                    Err(e) => {
+                        debug!("Failed to use id_ed25519: {}", e);
+                    }
+                }
+            }
+            
+            error!("No working SSH authentication method found");
+            Err(git2::Error::from_str("No SSH authentication method available"))
         });
 
         let mut push_options = git2::PushOptions::new();
         push_options.remote_callbacks(callbacks);
+        
+        // Try to set proxy options from git config
+        let mut proxy_options = git2::ProxyOptions::new();
+        proxy_options.auto();
+        push_options.proxy_options(proxy_options);
 
         // Push the branch
         let refspec = format!(
             "refs/heads/{}:refs/heads/{}",
             self.config.branch_name, self.config.branch_name
         );
-        remote.push(&[&refspec], Some(&mut push_options))?;
-
-        Ok(())
+        
+        debug!("Pushing refspec: {}", refspec);
+        match remote.push(&[&refspec], Some(&mut push_options)) {
+            Ok(_) => {
+                info!("Push completed successfully to remote: {}", self.config.remote_name);
+                Ok(())
+            }
+            Err(e) => {
+                error!("Push failed to remote {}: {}", self.config.remote_name, e);
+                Err(e.into())
+            }
+        }
+        }
     }
 
     /// Perform a fast-forward merge
@@ -502,8 +697,6 @@ impl RepositorySynchronizer {
         if let Some(unhandled) = self.check_unhandled_files()? {
             let reason = match unhandled {
                 UnhandledFileState::Conflicted { path } => format!("Conflicted file: {}", path),
-                UnhandledFileState::Staged { path } => format!("Staged changes in: {}", path),
-                UnhandledFileState::Untracked { path } => format!("Untracked file: {}", path),
             };
             return Err(SyncError::ManualInterventionRequired { reason });
         }

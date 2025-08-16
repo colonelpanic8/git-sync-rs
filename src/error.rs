@@ -2,8 +2,8 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum SyncError {
-    #[error("Not a git repository")]
-    NotARepository,
+    #[error("Not a git repository: {path}")]
+    NotARepository { path: String },
 
     #[error("Repository in unsafe state: {state}")]
     UnsafeRepositoryState { state: String },
@@ -29,6 +29,12 @@ pub enum SyncError {
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
 
+    #[error("Watch error: {0}")]
+    WatchError(String),
+
+    #[error("Task error: {0}")]
+    TaskError(String),
+
     #[error("Other error: {0}")]
     Other(String),
 }
@@ -37,7 +43,7 @@ impl SyncError {
     /// Get the exit code for this error type, matching the original git-sync
     pub fn exit_code(&self) -> i32 {
         match self {
-            SyncError::NotARepository => 128, // Match git's error code
+            SyncError::NotARepository { .. } => 128, // Match git's error code
             SyncError::UnsafeRepositoryState { .. } => 2,
             SyncError::DetachedHead => 2,
             SyncError::NoRemoteConfigured { .. } => 2,
@@ -54,9 +60,23 @@ impl SyncError {
                 }
             }
             SyncError::IoError(_) => 2,
+            SyncError::WatchError(_) => 2,
+            SyncError::TaskError(_) => 2,
             SyncError::Other(_) => 2,
         }
     }
 }
 
 pub type Result<T> = std::result::Result<T, SyncError>;
+
+impl From<notify::Error> for SyncError {
+    fn from(err: notify::Error) -> Self {
+        SyncError::WatchError(err.to_string())
+    }
+}
+
+impl From<tokio::task::JoinError> for SyncError {
+    fn from(err: tokio::task::JoinError) -> Self {
+        SyncError::TaskError(err.to_string())
+    }
+}
