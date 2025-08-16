@@ -307,6 +307,7 @@ skip_hooks = false
 
 # Commit message template
 # Available placeholders: {hostname}, {timestamp}
+# {timestamp} format: YYYY-MM-DD HH:MM:SS AM/PM TZ (e.g., 2024-03-15 02:30:45 PM PST)
 commit_message = "changes from {hostname} on {timestamp}"
 
 # Default remote name

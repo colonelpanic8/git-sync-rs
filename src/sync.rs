@@ -319,13 +319,13 @@ impl RepositorySynchronizer {
             msg.replace("{hostname}", &hostname::get()?.to_string_lossy())
                 .replace(
                     "{timestamp}",
-                    &Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                    &Local::now().format("%Y-%m-%d %I:%M:%S %p %Z").to_string(),
                 )
         } else {
             format!(
                 "changes from {} on {}",
                 hostname::get()?.to_string_lossy(),
-                Local::now().format("%Y-%m-%d %H:%M:%S")
+                Local::now().format("%Y-%m-%d %I:%M:%S %p %Z")
             )
         };
 
