@@ -33,6 +33,10 @@ struct Cli {
     #[arg(short = 's', long, global = true)]
     sync_anyway: bool,
 
+    /// Dry run mode - detect changes but don't sync (for default watch mode)
+    #[arg(long, global = true)]
+    dry_run: bool,
+
     /// Remote name to sync with
     #[arg(short = 'r', long, global = true)]
     remote: Option<String>,
@@ -51,7 +55,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Perform one-time synchronization (default)
+    /// Perform one-time synchronization
     Sync {
         /// Only check if sync is possible
         #[arg(long)]
@@ -61,7 +65,7 @@ enum Commands {
     /// Verify repository is ready to sync
     Check,
 
-    /// Start watching mode with automatic sync
+    /// Start watching mode with automatic sync (default)
     Watch {
         /// Debounce period in seconds (can use decimals like 0.5)
         #[arg(long, default_value = "0.5")]
@@ -78,10 +82,6 @@ enum Commands {
         /// Don't sync on startup
         #[arg(long)]
         no_initial_sync: bool,
-
-        /// Dry run mode - detect changes but don't sync
-        #[arg(long)]
-        dry_run: bool,
     },
 
     /// Initialize config file with example
@@ -169,6 +169,9 @@ async fn run(cli: Cli) -> Result<()> {
     // Ensure the repository exists (clone if needed)
     ensure_repository_exists(&repo_path)?;
 
+    // Log which repository we're working with
+    info!("Working with repository: {}", repo_path.display());
+
     // Load configuration with proper precedence:
     // CLI args > env vars > config file > defaults
     let sync_config = loader.to_sync_config(
@@ -179,9 +182,28 @@ async fn run(cli: Cli) -> Result<()> {
 
     // Handle commands
     match cli.command {
-        Some(Commands::Check) | None => {
-            // Default to check if no command specified
-            run_check(&repo_path, sync_config).await
+        Some(Commands::Check) => run_check(&repo_path, sync_config).await,
+        None => {
+            // Default to watch if no command specified
+            let config = loader.load()?;
+
+            let watch_config = WatchConfig {
+                debounce_ms: 500,      // Default 0.5 seconds
+                min_interval_ms: 1000, // Default 1 second
+                sync_on_start: true,
+                dry_run: cli.dry_run, // Use global dry_run flag
+            };
+
+            let interval_ms = Some(config.defaults.sync_interval * 1000);
+
+            if cli.dry_run {
+                info!("Starting watch mode in DRY RUN mode (default)");
+            } else {
+                info!("Starting watch mode (default)");
+            }
+            watch_with_periodic_sync(&repo_path, sync_config, watch_config, interval_ms)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))
         }
         Some(Commands::Sync { check_only }) => {
             if check_only {
@@ -195,7 +217,6 @@ async fn run(cli: Cli) -> Result<()> {
             min_interval,
             interval,
             no_initial_sync,
-            dry_run,
         }) => {
             // Load config once
             let config = loader.load()?;
@@ -204,7 +225,7 @@ async fn run(cli: Cli) -> Result<()> {
                 debounce_ms: (debounce * 1000.0) as u64,
                 min_interval_ms: (min_interval * 1000.0) as u64,
                 sync_on_start: !no_initial_sync,
-                dry_run,
+                dry_run: cli.dry_run, // Use global dry_run flag
             };
 
             // Use interval from CLI or defaults (repo config would need separate loading)
@@ -212,7 +233,7 @@ async fn run(cli: Cli) -> Result<()> {
                 .or(Some(config.defaults.sync_interval))
                 .map(|secs| secs * 1000);
 
-            if dry_run {
+            if cli.dry_run {
                 info!(
                     "Starting watch mode in DRY RUN mode - changes will be detected but not synced"
                 );
