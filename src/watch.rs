@@ -3,10 +3,10 @@ use crate::sync::{RepositorySynchronizer, SyncConfig};
 use git2::Repository;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio::sync::Mutex;
 use tokio::time;
 use tracing::{debug, error, info};
 
@@ -42,7 +42,7 @@ pub struct WatchManager {
     repo_path: String,
     sync_config: SyncConfig,
     watch_config: WatchConfig,
-    is_syncing: Arc<Mutex<bool>>,
+    is_syncing: Arc<AtomicBool>,
 }
 
 /// Event handler for file system changes
@@ -183,7 +183,7 @@ impl WatchManager {
             repo_path: expanded,
             sync_config,
             watch_config,
-            is_syncing: Arc::new(Mutex::new(false)),
+            is_syncing: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -293,24 +293,20 @@ impl WatchManager {
         }
 
         // Check if already syncing
-        let is_syncing = self.is_syncing.lock().await;
-        if *is_syncing {
+        if self.is_syncing.load(Ordering::Acquire) {
             debug!("Sync already in progress, skipping");
             return;
         }
-        drop(is_syncing); // Release lock before syncing
 
         info!("Changes detected, triggering sync");
-        eprintln!("[watch] Changes detected, attempting perform_sync");
         match self.perform_sync().await {
             Ok(()) => {
                 // Only record successful syncs
-                eprintln!("[watch] perform_sync succeeded");
+                debug!("perform_sync succeeded");
                 sync_state.record_sync();
             }
             Err(e) => {
                 // Do not clear pending flag on failure; allow retry
-                eprintln!("[watch] perform_sync failed: {}", e);
                 error!("Sync failed: {}", e);
             }
         }
@@ -318,14 +314,10 @@ impl WatchManager {
 
     /// Perform a synchronization
     async fn perform_sync(&self) -> Result<()> {
-        // Set syncing flag
-        {
-            let mut is_syncing = self.is_syncing.lock().await;
-            if *is_syncing {
-                debug!("Sync already in progress");
-                return Ok(());
-            }
-            *is_syncing = true;
+        // Set syncing flag (lock-free)
+        if self.is_syncing.swap(true, Ordering::AcqRel) {
+            debug!("Sync already in progress");
+            return Ok(());
         }
 
         // Run the sync and ensure we clear the syncing flag regardless of outcome
@@ -337,7 +329,7 @@ impl WatchManager {
             let repo_path = self.repo_path.clone();
             let sync_config = self.sync_config.clone();
 
-            eprintln!("[watch] perform_sync: spawning blocking sync task");
+            debug!("Spawning blocking sync task");
             match tokio::task::spawn_blocking(move || {
                 // Create synchronizer
                 let synchronizer =
@@ -353,15 +345,12 @@ impl WatchManager {
             }
         };
 
-        // Clear syncing flag in a finally-like manner
-        {
-            let mut is_syncing = self.is_syncing.lock().await;
-            *is_syncing = false;
-        }
+        // Clear syncing flag (finally-like)
+        self.is_syncing.store(false, Ordering::Release);
 
-        eprintln!(
-            "[watch] perform_sync: clearing syncing flag and returning (result: {:?})",
-            result.as_ref().map(|_| ()).map_err(|_| ())
+        debug!(
+            "perform_sync finished with result: {}",
+            if result.is_ok() { "ok" } else { "err" }
         );
         result
     }
@@ -394,17 +383,12 @@ impl SyncState {
 
     fn should_sync(&self) -> bool {
         if !self.pending_sync {
-            eprintln!("[watch] should_sync: pending=false");
             return false;
         }
 
         // Enforce minimum interval between syncs (throttle ensures progress)
         let since_last_sync = self.last_sync.elapsed();
         if since_last_sync < self.min_interval {
-            eprintln!(
-                "[watch] should_sync: too-soon since last_sync: {:?} < {:?}",
-                since_last_sync, self.min_interval
-            );
             debug!("Too soon since last sync, waiting");
             return false;
         }
@@ -414,19 +398,8 @@ impl SyncState {
         if let Some(t) = self.last_event {
             let since_last_event = t.elapsed();
             if since_last_event < self.debounce {
-                eprintln!(
-                    "[watch] should_sync: within debounce {:?} < {:?}, but proceeding due to min_interval",
-                    since_last_event, self.debounce
-                );
-                debug!("Debounce window active, but min-interval passed; proceeding");
-            } else {
-                eprintln!(
-                    "[watch] should_sync: quiet period satisfied: {:?} >= {:?}",
-                    since_last_event, self.debounce
-                );
+                debug!("Debounce active, but proceeding due to min-interval");
             }
-        } else {
-            eprintln!("[watch] should_sync: last_event=None (unexpected), proceeding");
         }
 
         true
