@@ -233,16 +233,24 @@ impl WatchManager {
             self.watch_config.min_interval_ms,
         );
 
-        loop {
-            let timeout = time::sleep(Duration::from_millis(self.watch_config.debounce_ms));
-            tokio::pin!(timeout);
+        // Periodic interval prevents starvation under continuous events
+        let tick_ms = self
+            .watch_config
+            .debounce_ms
+            .min(self.watch_config.min_interval_ms)
+            .max(50);
+        let mut interval = time::interval(Duration::from_millis(tick_ms));
+        interval.tick().await; // align first tick
 
+        loop {
             tokio::select! {
+                biased;
+                // Give the interval a chance first to avoid starvation
+                _ = interval.tick() => {
+                    self.handle_timeout(&mut sync_state).await;
+                }
                 Some(event) = rx.recv() => {
                     self.handle_file_event(event, &mut sync_state);
-                }
-                _ = &mut timeout => {
-                    self.handle_timeout(&mut sync_state).await;
                 }
             }
         }
@@ -293,11 +301,16 @@ impl WatchManager {
         drop(is_syncing); // Release lock before syncing
 
         info!("Changes detected, triggering sync");
-        if let Err(e) = self.perform_sync().await {
-            error!("Sync failed: {}", e);
+        match self.perform_sync().await {
+            Ok(()) => {
+                // Only record successful syncs
+                sync_state.record_sync();
+            }
+            Err(e) => {
+                // Do not clear pending flag on failure; allow retry
+                error!("Sync failed: {}", e);
+            }
         }
-
-        sync_state.record_sync();
     }
 
     /// Perform a synchronization
@@ -312,37 +325,34 @@ impl WatchManager {
             *is_syncing = true;
         }
 
-        if self.watch_config.dry_run {
+        // Run the sync and ensure we clear the syncing flag regardless of outcome
+        let result: Result<()> = if self.watch_config.dry_run {
             info!("DRY RUN: Would perform sync now");
-            // Clear syncing flag
-            {
-                let mut is_syncing = self.is_syncing.lock().await;
-                *is_syncing = false;
-            }
-            return Ok(());
-        }
+            Ok(())
+        } else {
+            // Perform sync in blocking task
+            let repo_path = self.repo_path.clone();
+            let sync_config = self.sync_config.clone();
 
-        // Perform sync in blocking task
-        let repo_path = self.repo_path.clone();
-        let sync_config = self.sync_config.clone();
+            tokio::task::spawn_blocking(move || {
+                // Create synchronizer
+                let synchronizer =
+                    RepositorySynchronizer::new_with_detected_branch(&repo_path, sync_config)?;
 
-        tokio::task::spawn_blocking(move || {
-            // Create synchronizer
-            let synchronizer =
-                RepositorySynchronizer::new_with_detected_branch(&repo_path, sync_config)?;
+                // Perform sync
+                synchronizer.sync(false)
+            })
+            .await??;
+            Ok(())
+        };
 
-            // Perform sync
-            synchronizer.sync(false)
-        })
-        .await??;
-
-        // Clear syncing flag
+        // Clear syncing flag in a finally-like manner
         {
             let mut is_syncing = self.is_syncing.lock().await;
             *is_syncing = false;
         }
 
-        Ok(())
+        result
     }
 }
 
@@ -351,19 +361,24 @@ struct SyncState {
     last_sync: time::Instant,
     pending_sync: bool,
     min_interval: Duration,
+    debounce: Duration,
+    last_event: Option<time::Instant>,
 }
 
 impl SyncState {
-    fn new(_debounce_ms: u64, min_interval_ms: u64) -> Self {
+    fn new(debounce_ms: u64, min_interval_ms: u64) -> Self {
         Self {
             last_sync: time::Instant::now(),
             pending_sync: false,
             min_interval: Duration::from_millis(min_interval_ms),
+            debounce: Duration::from_millis(debounce_ms),
+            last_event: None,
         }
     }
 
     fn mark_pending(&mut self) {
         self.pending_sync = true;
+        self.last_event = Some(time::Instant::now());
     }
 
     fn should_sync(&self) -> bool {
@@ -371,8 +386,17 @@ impl SyncState {
             return false;
         }
 
-        let elapsed = self.last_sync.elapsed();
-        if elapsed < self.min_interval {
+        // Require a quiet period since the last relevant event
+        match self.last_event {
+            Some(t) if t.elapsed() >= self.debounce => {}
+            _ => {
+                debug!("Debounce window active, waiting");
+                return false;
+            }
+        }
+
+        // Enforce minimum interval between syncs
+        if self.last_sync.elapsed() < self.min_interval {
             debug!("Too soon since last sync, waiting");
             return false;
         }
@@ -383,6 +407,7 @@ impl SyncState {
     fn record_sync(&mut self) {
         self.last_sync = time::Instant::now();
         self.pending_sync = false;
+        self.last_event = None;
     }
 }
 
