@@ -1,4 +1,4 @@
-use crate::error::Result;
+use crate::error::{Result, SyncError};
 use crate::sync::{RepositorySynchronizer, SyncConfig};
 use git2::Repository;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Watch mode configuration
 #[derive(Debug, Clone)]
@@ -299,6 +299,15 @@ impl WatchManager {
         }
 
         info!("Changes detected, triggering sync");
+        // Attach a span with useful fields for diagnostics
+        let span = tracing::info_span!(
+            "perform_sync_attempt",
+            repo = %self.repo_path,
+            branch = %self.sync_config.branch_name,
+            remote = %self.sync_config.remote_name,
+            dry_run = self.watch_config.dry_run
+        );
+        let _guard = span.enter();
         match self.perform_sync().await {
             Ok(()) => {
                 // Only record successful syncs
@@ -307,7 +316,38 @@ impl WatchManager {
             }
             Err(e) => {
                 // Do not clear pending flag on failure; allow retry
-                error!("Sync failed: {}", e);
+                match &e {
+                    SyncError::DetachedHead => error!(
+                        "Sync failed: detached HEAD. Repository must be on a branch; will retry."
+                    ),
+                    SyncError::UnsafeRepositoryState { state } => error!(
+                        state = %state,
+                        "Sync failed: repository in unsafe state; will retry"
+                    ),
+                    SyncError::ManualInterventionRequired { reason } => warn!(
+                        reason = %reason,
+                        "Sync requires manual intervention; pending will remain set"
+                    ),
+                    SyncError::NoRemoteConfigured { branch } => error!(
+                        branch = %branch,
+                        "Sync failed: no remote configured for branch"
+                    ),
+                    SyncError::NetworkError(msg) => error!(
+                        error = %msg,
+                        "Network error during sync; will retry"
+                    ),
+                    SyncError::TaskError(msg) => error!(
+                        error = %msg,
+                        "Background task error during sync; will retry"
+                    ),
+                    SyncError::GitError(err) => error!(
+                        code = ?err.code(),
+                        klass = ?err.class(),
+                        message = %err.message(),
+                        "Git error during sync; will retry"
+                    ),
+                    other => error!(error = %other, "Sync failed; will retry"),
+                }
             }
         }
     }
@@ -341,17 +381,21 @@ impl WatchManager {
             .await
             {
                 Ok(inner) => inner,
-                Err(e) => Err(e.into()),
+                Err(e) => {
+                    error!("Join error waiting for sync task: {}", e);
+                    Err(e.into())
+                }
             }
         };
 
         // Clear syncing flag (finally-like)
         self.is_syncing.store(false, Ordering::Release);
 
-        debug!(
-            "perform_sync finished with result: {}",
-            if result.is_ok() { "ok" } else { "err" }
-        );
+        if let Err(ref err) = result {
+            error!(error = %err, "perform_sync finished with error");
+        } else {
+            debug!("perform_sync finished successfully");
+        }
         result
     }
 }
