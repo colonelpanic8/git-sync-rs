@@ -301,13 +301,16 @@ impl WatchManager {
         drop(is_syncing); // Release lock before syncing
 
         info!("Changes detected, triggering sync");
+        eprintln!("[watch] Changes detected, attempting perform_sync");
         match self.perform_sync().await {
             Ok(()) => {
                 // Only record successful syncs
+                eprintln!("[watch] perform_sync succeeded");
                 sync_state.record_sync();
             }
             Err(e) => {
                 // Do not clear pending flag on failure; allow retry
+                eprintln!("[watch] perform_sync failed: {}", e);
                 error!("Sync failed: {}", e);
             }
         }
@@ -334,7 +337,8 @@ impl WatchManager {
             let repo_path = self.repo_path.clone();
             let sync_config = self.sync_config.clone();
 
-            tokio::task::spawn_blocking(move || {
+            eprintln!("[watch] perform_sync: spawning blocking sync task");
+            match tokio::task::spawn_blocking(move || {
                 // Create synchronizer
                 let synchronizer =
                     RepositorySynchronizer::new_with_detected_branch(&repo_path, sync_config)?;
@@ -342,8 +346,11 @@ impl WatchManager {
                 // Perform sync
                 synchronizer.sync(false)
             })
-            .await??;
-            Ok(())
+            .await
+            {
+                Ok(inner) => inner,
+                Err(e) => Err(e.into()),
+            }
         };
 
         // Clear syncing flag in a finally-like manner
@@ -352,6 +359,10 @@ impl WatchManager {
             *is_syncing = false;
         }
 
+        eprintln!(
+            "[watch] perform_sync: clearing syncing flag and returning (result: {:?})",
+            result.as_ref().map(|_| ()).map_err(|_| ())
+        );
         result
     }
 }
@@ -383,22 +394,39 @@ impl SyncState {
 
     fn should_sync(&self) -> bool {
         if !self.pending_sync {
+            eprintln!("[watch] should_sync: pending=false");
             return false;
         }
 
-        // Require a quiet period since the last relevant event
-        match self.last_event {
-            Some(t) if t.elapsed() >= self.debounce => {}
-            _ => {
-                debug!("Debounce window active, waiting");
-                return false;
-            }
-        }
-
-        // Enforce minimum interval between syncs
-        if self.last_sync.elapsed() < self.min_interval {
+        // Enforce minimum interval between syncs (throttle ensures progress)
+        let since_last_sync = self.last_sync.elapsed();
+        if since_last_sync < self.min_interval {
+            eprintln!(
+                "[watch] should_sync: too-soon since last_sync: {:?} < {:?}",
+                since_last_sync, self.min_interval
+            );
             debug!("Too soon since last sync, waiting");
             return false;
+        }
+
+        // Prefer to wait for quiet period, but do not starve: if min_interval
+        // has elapsed, allow sync even if events keep arriving.
+        if let Some(t) = self.last_event {
+            let since_last_event = t.elapsed();
+            if since_last_event < self.debounce {
+                eprintln!(
+                    "[watch] should_sync: within debounce {:?} < {:?}, but proceeding due to min_interval",
+                    since_last_event, self.debounce
+                );
+                debug!("Debounce window active, but min-interval passed; proceeding");
+            } else {
+                eprintln!(
+                    "[watch] should_sync: quiet period satisfied: {:?} >= {:?}",
+                    since_last_event, self.debounce
+                );
+            }
+        } else {
+            eprintln!("[watch] should_sync: last_event=None (unexpected), proceeding");
         }
 
         true

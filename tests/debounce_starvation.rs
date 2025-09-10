@@ -51,12 +51,13 @@ async fn continuous_changes_starve_debounce() -> Result<()> {
         tokio::time::sleep(Duration::from_millis(40)).await; // keep events flowing
     }
 
-    // While changes are continuous, no sync should have occurred yet.
-    // Pull in second clone and verify the file is not present.
+    // Even while changes are continuous, with throttle we should make progress.
+    // After some time, a sync should have occurred despite ongoing events.
+    tokio::time::sleep(Duration::from_millis(600)).await;
     setup.pull_in(&second_clone)?;
     assert!(
-        !Path::new(&second_clone).join("burst.txt").exists(),
-        "File unexpectedly synced during continuous change stream"
+        Path::new(&second_clone).join("burst.txt").exists(),
+        "File not synced during continuous change stream with throttle"
     );
 
     // After changes stop, debounce should fire and a sync should happen shortly.

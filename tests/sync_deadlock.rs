@@ -83,21 +83,27 @@ async fn sync_stuck_after_error_during_watch() -> Result<()> {
         // Print some debugging info to help diagnose
         let status_out = std::process::Command::new("git")
             .current_dir(&setup.local_path)
-            .args(["status", "--porcelain"]).output()?;
+            .args(["status", "--porcelain"])
+            .output()?;
         println!(
             "LOCAL status:\n{}",
             String::from_utf8_lossy(&status_out.stdout)
         );
         let log_out = std::process::Command::new("git")
             .current_dir(&setup.local_path)
-            .args(["--no-pager", "log", "--oneline", "-n", "5"]).output()?;
+            .args(["--no-pager", "log", "--oneline", "-n", "5"])
+            .output()?;
         println!("LOCAL log:\n{}", String::from_utf8_lossy(&log_out.stdout));
         let ls_out = std::process::Command::new("ls")
             .current_dir(&setup.local_path)
-            .arg("-la").output()?;
+            .arg("-la")
+            .output()?;
         println!("LOCAL ls:\n{}", String::from_utf8_lossy(&ls_out.stdout));
     }
-    assert!(synced, "File was not synced after repairing repo state; likely stuck syncing");
+    assert!(
+        synced,
+        "File was not synced after repairing repo state; likely stuck syncing"
+    );
 
     watch_handle.abort();
     Ok(())
