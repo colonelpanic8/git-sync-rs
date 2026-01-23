@@ -249,7 +249,7 @@ async fn run(cli: Cli) -> Result<()> {
 
 async fn run_check(repo_path: &std::path::Path, config: SyncConfig) -> Result<()> {
     // Create synchronizer with auto-detected branch
-    let synchronizer = RepositorySynchronizer::new_with_detected_branch(repo_path, config)?;
+    let mut synchronizer = RepositorySynchronizer::new_with_detected_branch(repo_path, config)?;
 
     // Get current branch
     let current_branch = synchronizer.get_current_branch()?;
@@ -272,7 +272,7 @@ async fn run_check(repo_path: &std::path::Path, config: SyncConfig) -> Result<()
 
 async fn run_sync(repo_path: &std::path::Path, config: SyncConfig) -> Result<()> {
     // Create synchronizer with auto-detected branch
-    let synchronizer = RepositorySynchronizer::new_with_detected_branch(repo_path, config)?;
+    let mut synchronizer = RepositorySynchronizer::new_with_detected_branch(repo_path, config)?;
 
     // Get current branch
     let current_branch = synchronizer.get_current_branch()?;

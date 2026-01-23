@@ -31,9 +31,11 @@ fn handle_merge_conflict_with_local_changes() -> Result<()> {
         commit_message: Some("Sync conflict".to_string()),
         remote_name: "origin".to_string(),
         branch_name: "master".to_string(),
+        conflict_branch: false,
+        target_branch: None,
     };
 
-    let sync = RepositorySynchronizer::new_with_detected_branch(&setup.local_path, config)?;
+    let mut sync = RepositorySynchronizer::new_with_detected_branch(&setup.local_path, config)?;
     let result = sync.sync(false);
 
     // Should handle conflict (either merge or fail gracefully)
@@ -75,9 +77,11 @@ fn conflict_resolution_with_merge() -> Result<()> {
         commit_message: Some("Merge: {hostname} at {timestamp}".to_string()),
         remote_name: "origin".to_string(),
         branch_name: "master".to_string(),
+        conflict_branch: false,
+        target_branch: None,
     };
 
-    let synchronizer =
+    let mut synchronizer =
         RepositorySynchronizer::new_with_detected_branch(&setup.local_path, sync_config)?;
 
     // This might fail if there's a conflict that can't be auto-resolved

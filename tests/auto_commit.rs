@@ -26,9 +26,11 @@ fn auto_commit_new_files() -> Result<()> {
         commit_message: Some("Auto-commit: {hostname} at {timestamp}".to_string()),
         remote_name: "origin".to_string(),
         branch_name: "master".to_string(),
+        conflict_branch: false,
+        target_branch: None,
     };
 
-    let synchronizer =
+    let mut synchronizer =
         RepositorySynchronizer::new_with_detected_branch(&setup.local_path, sync_config)?;
     synchronizer.sync(false)?;
 

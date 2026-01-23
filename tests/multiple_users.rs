@@ -31,9 +31,11 @@ fn multiple_users_concurrent_changes() -> Result<()> {
         commit_message: Some("Sync user1".to_string()),
         remote_name: "origin".to_string(),
         branch_name: "master".to_string(),
+        conflict_branch: false,
+        target_branch: None,
     };
 
-    let sync = RepositorySynchronizer::new_with_detected_branch(&setup.local_path, config.clone())?;
+    let mut sync = RepositorySynchronizer::new_with_detected_branch(&setup.local_path, config.clone())?;
     sync.sync(false)?;
 
     // User3 tries to push (should fail, needs to pull first)
@@ -44,7 +46,7 @@ fn multiple_users_concurrent_changes() -> Result<()> {
     );
 
     // User3 syncs
-    let sync3 = RepositorySynchronizer::new_with_detected_branch(&user3, config)?;
+    let mut sync3 = RepositorySynchronizer::new_with_detected_branch(&user3, config)?;
     sync3.sync(false)?;
 
     // Everyone should have all files now

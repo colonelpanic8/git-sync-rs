@@ -33,6 +33,10 @@ pub struct DefaultConfig {
 
     #[serde(default = "default_remote")]
     pub remote: String,
+
+    /// When true, create a fallback branch on merge conflicts instead of failing
+    #[serde(default)]
+    pub conflict_branch: bool,
 }
 
 impl Default for DefaultConfig {
@@ -43,6 +47,7 @@ impl Default for DefaultConfig {
             skip_hooks: false,
             commit_message: default_commit_message(),
             remote: default_remote(),
+            conflict_branch: false,
         }
     }
 }
@@ -72,6 +77,10 @@ pub struct RepositoryConfig {
 
     #[serde(default)]
     pub interval: Option<u64>, // seconds
+
+    /// When true, create a fallback branch on merge conflicts instead of failing
+    #[serde(default)]
+    pub conflict_branch: Option<bool>,
 }
 
 // Default value functions for serde
@@ -167,6 +176,7 @@ impl ConfigLoader {
                     branch: None,
                     watch: false,
                     interval: None,
+                    conflict_branch: None,
                 }
             });
 
@@ -203,7 +213,13 @@ impl ConfigLoader {
                 .or(repo_config.remote)
                 .unwrap_or(config.defaults.remote),
 
-            branch_name: repo_config.branch.unwrap_or_default(), // Will be auto-detected
+            branch_name: repo_config.branch.clone().unwrap_or_default(), // Will be auto-detected
+
+            conflict_branch: repo_config
+                .conflict_branch
+                .unwrap_or(config.defaults.conflict_branch),
+
+            target_branch: repo_config.branch, // The branch we want to track
         })
     }
 
@@ -285,6 +301,7 @@ impl ConfigLoader {
                     branch: None,
                     watch: true, // Assume watch mode when using env var
                     interval: None,
+                    conflict_branch: None,
                 });
             }
         }
@@ -313,6 +330,12 @@ commit_message = "changes from {hostname} on {timestamp}"
 # Default remote name
 remote = "origin"
 
+# Create fallback branch on merge conflicts instead of failing
+# When enabled, conflicts cause git-sync to switch to a branch like
+# git-sync/{hostname}-{timestamp} and continue syncing there.
+# It will automatically return to the target branch when possible.
+conflict_branch = false
+
 # Example repository configurations
 [[repositories]]
 path = "/home/user/notes"
@@ -321,6 +344,7 @@ remote = "origin"
 branch = "main"
 watch = true
 interval = 30  # Override sync interval for this repo
+conflict_branch = true  # Enable fallback branch for this repo
 
 [[repositories]]
 path = "/home/user/dotfiles"

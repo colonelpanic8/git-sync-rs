@@ -372,7 +372,7 @@ impl WatchManager {
             debug!("Spawning blocking sync task");
             match tokio::task::spawn_blocking(move || {
                 // Create synchronizer
-                let synchronizer =
+                let mut synchronizer =
                     RepositorySynchronizer::new_with_detected_branch(&repo_path, sync_config)?;
 
                 // Perform sync

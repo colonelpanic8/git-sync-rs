@@ -1,8 +1,11 @@
 use crate::error::{Result, SyncError};
 use chrono::Local;
-use git2::{BranchType, Repository, Status, StatusOptions};
+use git2::{BranchType, MergeOptions, Oid, Repository, Status, StatusOptions};
 use std::path::{Path, PathBuf};
 use tracing::{debug, error, info, warn};
+
+/// Prefix for fallback branches created by git-sync
+pub const FALLBACK_BRANCH_PREFIX: &str = "git-sync/";
 
 /// Configuration for the synchronizer
 #[derive(Debug, Clone)]
@@ -19,8 +22,15 @@ pub struct SyncConfig {
     /// Remote name to sync with (e.g., "origin")
     pub remote_name: String,
 
-    /// Branch name to sync
+    /// Branch name to sync (current working branch)
     pub branch_name: String,
+
+    /// When true, create a fallback branch on merge conflicts instead of failing
+    pub conflict_branch: bool,
+
+    /// The target branch we want to track (used for returning from fallback)
+    /// If None, defaults to the repository's default branch
+    pub target_branch: Option<String>,
 }
 
 impl Default for SyncConfig {
@@ -31,6 +41,8 @@ impl Default for SyncConfig {
             commit_message: None,
             remote_name: "origin".to_string(),
             branch_name: "main".to_string(),
+            conflict_branch: false,
+            target_branch: None,
         }
     }
 }
@@ -89,11 +101,20 @@ pub enum UnhandledFileState {
     Conflicted { path: String },
 }
 
+/// State for tracking fallback branch return attempts (in-memory only)
+#[derive(Debug, Clone, Default)]
+pub struct FallbackState {
+    /// The OID of the target branch when we last checked if return was possible
+    /// Used to avoid redundant merge checks when target hasn't moved
+    pub last_checked_target_oid: Option<Oid>,
+}
+
 /// Main synchronizer struct
 pub struct RepositorySynchronizer {
     repo: Repository,
     config: SyncConfig,
     _repo_path: PathBuf,
+    fallback_state: FallbackState,
 }
 
 impl RepositorySynchronizer {
@@ -108,6 +129,7 @@ impl RepositorySynchronizer {
             repo,
             config,
             _repo_path: repo_path,
+            fallback_state: FallbackState::default(),
         })
     }
 
@@ -134,6 +156,7 @@ impl RepositorySynchronizer {
             repo,
             config,
             _repo_path: repo_path,
+            fallback_state: FallbackState::default(),
         })
     }
 
@@ -340,17 +363,16 @@ impl RepositorySynchronizer {
         Ok(())
     }
 
-    /// Fetch from remote
-    pub fn fetch(&self) -> Result<()> {
-        info!("Fetching from remote: {}", self.config.remote_name);
+    /// Fetch a specific branch from remote
+    pub fn fetch_branch(&self, branch: &str) -> Result<()> {
+        info!("Fetching branch {} from remote: {}", branch, self.config.remote_name);
 
-        // Use git command directly as a workaround for SSH issues
         use std::process::Command;
 
         let output = Command::new("git")
             .arg("fetch")
             .arg(&self.config.remote_name)
-            .arg(&self.config.branch_name)
+            .arg(branch)
             .current_dir(&self._repo_path)
             .output()
             .map_err(|e| SyncError::Other(format!("Failed to run git fetch: {}", e)))?;
@@ -362,9 +384,26 @@ impl RepositorySynchronizer {
         }
 
         info!(
-            "Fetch completed successfully from remote: {}",
-            self.config.remote_name
+            "Fetch completed successfully for branch {} from remote: {}",
+            branch, self.config.remote_name
         );
+        Ok(())
+    }
+
+    /// Fetch from remote
+    pub fn fetch(&self) -> Result<()> {
+        self.fetch_branch(&self.config.branch_name)?;
+
+        // If we're on a fallback branch and have a target branch, also fetch that
+        if self.config.conflict_branch {
+            if let Ok(target) = self.get_target_branch() {
+                if target != self.config.branch_name {
+                    // Ignore errors fetching target - it might not be necessary
+                    let _ = self.fetch_branch(&target);
+                }
+            }
+        }
+
         return Ok(());
 
         // Original libgit2 implementation (keeping for reference)
@@ -688,6 +727,12 @@ impl RepositorySynchronizer {
             if self.repo.index()?.has_conflicts() {
                 warn!("Conflicts detected during rebase");
                 rebase.abort()?;
+
+                // If conflict_branch is enabled, create a fallback branch
+                if self.config.conflict_branch {
+                    return self.handle_conflict_with_fallback();
+                }
+
                 return Err(SyncError::ManualInterventionRequired {
                     reason: "Rebase conflicts detected. Please resolve manually.".to_string(),
                 });
@@ -712,8 +757,363 @@ impl RepositorySynchronizer {
         Ok(())
     }
 
+    /// Detect the repository's default branch
+    pub fn detect_default_branch(&self) -> Result<String> {
+        // Try to get the default branch from origin/HEAD
+        if let Ok(reference) = self.repo.find_reference("refs/remotes/origin/HEAD") {
+            if let Ok(resolved) = reference.resolve() {
+                if let Some(name) = resolved.shorthand() {
+                    // name will be like "origin/main", extract just "main"
+                    if let Some(branch) = name.strip_prefix("origin/") {
+                        debug!("Detected default branch from origin/HEAD: {}", branch);
+                        return Ok(branch.to_string());
+                    }
+                }
+            }
+        }
+
+        // Fallback: check if main or master exists
+        if self.repo.find_branch("main", BranchType::Local).is_ok()
+            || self
+                .repo
+                .find_reference("refs/remotes/origin/main")
+                .is_ok()
+        {
+            debug!("Falling back to 'main' as default branch");
+            return Ok("main".to_string());
+        }
+
+        if self.repo.find_branch("master", BranchType::Local).is_ok()
+            || self
+                .repo
+                .find_reference("refs/remotes/origin/master")
+                .is_ok()
+        {
+            debug!("Falling back to 'master' as default branch");
+            return Ok("master".to_string());
+        }
+
+        // Last resort: use current branch
+        self.get_current_branch()
+    }
+
+    /// Get the target branch (the branch we want to be on)
+    pub fn get_target_branch(&self) -> Result<String> {
+        if let Some(ref target) = self.config.target_branch {
+            if !target.is_empty() {
+                return Ok(target.clone());
+            }
+        }
+        self.detect_default_branch()
+    }
+
+    /// Check if we're currently on a fallback branch
+    pub fn is_on_fallback_branch(&self) -> Result<bool> {
+        let current = self.get_current_branch()?;
+        Ok(current.starts_with(FALLBACK_BRANCH_PREFIX))
+    }
+
+    /// Generate a fallback branch name
+    fn generate_fallback_branch_name() -> String {
+        let hostname = hostname::get()
+            .map(|h| h.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
+        let timestamp = Local::now().format("%Y-%m-%d-%H%M%S");
+        format!("{}{}-{}", FALLBACK_BRANCH_PREFIX, hostname, timestamp)
+    }
+
+    /// Create and switch to a fallback branch
+    pub fn create_fallback_branch(&self) -> Result<String> {
+        let branch_name = Self::generate_fallback_branch_name();
+        info!("Creating fallback branch: {}", branch_name);
+
+        // Get current HEAD commit
+        let head_commit = self.repo.head()?.peel_to_commit()?;
+
+        // Create the new branch
+        self.repo
+            .branch(&branch_name, &head_commit, false)
+            .map_err(|e| SyncError::Other(format!("Failed to create fallback branch: {}", e)))?;
+
+        // Checkout the new branch
+        let refname = format!("refs/heads/{}", branch_name);
+        self.repo.set_head(&refname)?;
+
+        // Update working directory
+        let mut checkout_builder = git2::build::CheckoutBuilder::new();
+        checkout_builder.force();
+        self.repo
+            .checkout_head(Some(&mut checkout_builder))
+            .map_err(|e| {
+                SyncError::Other(format!("Failed to checkout fallback branch: {}", e))
+            })?;
+
+        info!("Switched to fallback branch: {}", branch_name);
+        Ok(branch_name)
+    }
+
+    /// Push a branch to remote (used for fallback branches)
+    pub fn push_branch(&self, branch_name: &str) -> Result<()> {
+        info!("Pushing branch {} to remote", branch_name);
+
+        use std::process::Command;
+
+        let output = Command::new("git")
+            .arg("push")
+            .arg("-u")
+            .arg(&self.config.remote_name)
+            .arg(branch_name)
+            .current_dir(&self._repo_path)
+            .output()
+            .map_err(|e| SyncError::Other(format!("Failed to run git push: {}", e)))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            error!("Git push failed: {}", stderr);
+            return Err(SyncError::Other(format!("Git push failed: {}", stderr)));
+        }
+
+        info!("Successfully pushed branch {} to remote", branch_name);
+        Ok(())
+    }
+
+    /// Check if merging target branch into current HEAD would succeed (in-memory, no working tree changes)
+    pub fn can_merge_cleanly(&self, target_branch: &str) -> Result<bool> {
+        // Get the target branch reference
+        let target_ref = format!("refs/remotes/{}/{}", self.config.remote_name, target_branch);
+        let target_reference = self.repo.find_reference(&target_ref).map_err(|e| {
+            SyncError::Other(format!(
+                "Failed to find target branch {}: {}",
+                target_branch, e
+            ))
+        })?;
+        let target_commit = target_reference.peel_to_commit()?;
+
+        // Get current HEAD
+        let head_commit = self.repo.head()?.peel_to_commit()?;
+
+        // Check if we're already ancestors (fast-forward possible)
+        if self
+            .repo
+            .graph_descendant_of(target_commit.id(), head_commit.id())?
+        {
+            debug!(
+                "Target branch {} is descendant of current HEAD, clean merge possible",
+                target_branch
+            );
+            return Ok(true);
+        }
+
+        // Perform in-memory merge to check for conflicts
+        let merge_opts = MergeOptions::new();
+        let index = self
+            .repo
+            .merge_commits(&head_commit, &target_commit, Some(&merge_opts))
+            .map_err(|e| SyncError::Other(format!("Failed to perform merge check: {}", e)))?;
+
+        let has_conflicts = index.has_conflicts();
+        debug!(
+            "In-memory merge check: has_conflicts={}",
+            has_conflicts
+        );
+
+        Ok(!has_conflicts)
+    }
+
+    /// Get the OID of the target branch on remote
+    fn get_target_branch_oid(&self, target_branch: &str) -> Result<Oid> {
+        let target_ref = format!("refs/remotes/{}/{}", self.config.remote_name, target_branch);
+        let reference = self.repo.find_reference(&target_ref)?;
+        reference
+            .target()
+            .ok_or_else(|| SyncError::Other("Target branch has no OID".to_string()))
+    }
+
+    /// Attempt to return to the target branch from a fallback branch
+    pub fn try_return_to_target(&mut self) -> Result<bool> {
+        if !self.is_on_fallback_branch()? {
+            return Ok(false);
+        }
+
+        let target_branch = self.get_target_branch()?;
+        info!(
+            "On fallback branch, checking if we can return to {}",
+            target_branch
+        );
+
+        // Get current target branch OID
+        let target_oid = match self.get_target_branch_oid(&target_branch) {
+            Ok(oid) => oid,
+            Err(e) => {
+                warn!("Could not find target branch {}: {}", target_branch, e);
+                return Ok(false);
+            }
+        };
+
+        // Check if target has moved since last check
+        if let Some(last_checked) = self.fallback_state.last_checked_target_oid {
+            if last_checked == target_oid {
+                debug!(
+                    "Target branch {} hasn't changed since last check, skipping merge check",
+                    target_branch
+                );
+                return Ok(false);
+            }
+        }
+
+        // Target has moved, check if we can merge cleanly
+        if !self.can_merge_cleanly(&target_branch)? {
+            info!(
+                "Cannot cleanly merge {} into current branch, staying on fallback",
+                target_branch
+            );
+            self.fallback_state.last_checked_target_oid = Some(target_oid);
+            return Ok(false);
+        }
+
+        info!(
+            "Clean merge possible, returning to target branch {}",
+            target_branch
+        );
+
+        // Get current branch commits that need to be rebased onto target
+        let current_branch = self.get_current_branch()?;
+        let current_oid = self.repo.head()?.target().ok_or_else(|| {
+            SyncError::Other("Current HEAD has no OID".to_string())
+        })?;
+
+        // Find merge base between our fallback branch and target
+        let merge_base = self.repo.merge_base(current_oid, target_oid)?;
+
+        // Check if we have commits to rebase
+        let (ahead, _) = self.repo.graph_ahead_behind(current_oid, merge_base)?;
+        let has_commits_to_rebase = ahead > 0;
+
+        // Checkout target branch
+        let target_ref = format!("refs/heads/{}", target_branch);
+
+        // First, make sure local target branch exists and is up to date
+        let remote_target_ref = format!("refs/remotes/{}/{}", self.config.remote_name, target_branch);
+        let remote_target = self.repo.find_reference(&remote_target_ref)?;
+        let remote_target_oid = remote_target.target().ok_or_else(|| {
+            SyncError::Other("Remote target has no OID".to_string())
+        })?;
+
+        // Update or create local target branch
+        if self.repo.find_reference(&target_ref).is_ok() {
+            // Update existing branch
+            self.repo.reference(
+                &target_ref,
+                remote_target_oid,
+                true,
+                "git-sync: updating target branch before return",
+            )?;
+        } else {
+            // Create local tracking branch
+            let remote_commit = self.repo.find_commit(remote_target_oid)?;
+            self.repo.branch(&target_branch, &remote_commit, false)?;
+        }
+
+        // Checkout target branch
+        self.repo.set_head(&target_ref)?;
+        let mut checkout_builder = git2::build::CheckoutBuilder::new();
+        checkout_builder.force();
+        self.repo.checkout_head(Some(&mut checkout_builder))?;
+
+        // Update config to reflect we're on the target branch now
+        self.config.branch_name = target_branch.clone();
+
+        if has_commits_to_rebase {
+            info!(
+                "Rebasing {} commits from {} onto {}",
+                ahead, current_branch, target_branch
+            );
+
+            // We need to rebase our commits from the fallback branch onto target
+            // Get the commits from the fallback branch
+            let fallback_ref = format!("refs/heads/{}", current_branch);
+            let fallback_reference = self.repo.find_reference(&fallback_ref)?;
+            let fallback_annotated = self.repo.reference_to_annotated_commit(&fallback_reference)?;
+
+            let target_reference = self.repo.find_reference(&target_ref)?;
+            let target_annotated = self.repo.reference_to_annotated_commit(&target_reference)?;
+
+            let sig = self.repo.signature()?;
+
+            // Start rebase
+            let mut rebase = self.repo.rebase(
+                Some(&fallback_annotated),
+                Some(&target_annotated),
+                None,
+                None,
+            )?;
+
+            // Process each commit
+            while let Some(operation) = rebase.next() {
+                let _operation = operation?;
+
+                if self.repo.index()?.has_conflicts() {
+                    warn!("Conflicts during rebase back to target, aborting");
+                    rebase.abort()?;
+                    // Switch back to fallback branch
+                    self.repo.set_head(&fallback_ref)?;
+                    self.repo.checkout_head(Some(&mut checkout_builder))?;
+                    self.config.branch_name = current_branch;
+                    self.fallback_state.last_checked_target_oid = Some(target_oid);
+                    return Ok(false);
+                }
+
+                rebase.commit(None, &sig, None)?;
+            }
+
+            rebase.finish(Some(&sig))?;
+
+            // Update working tree
+            let head = self.repo.head()?;
+            let head_commit = head.peel_to_commit()?;
+            self.repo
+                .checkout_tree(head_commit.as_object(), Some(&mut checkout_builder))?;
+        }
+
+        // Clear fallback state
+        self.fallback_state.last_checked_target_oid = None;
+
+        info!("Successfully returned to target branch {}", target_branch);
+        Ok(true)
+    }
+
+    /// Handle a rebase conflict by creating a fallback branch (when conflict_branch is enabled)
+    fn handle_conflict_with_fallback(&self) -> Result<()> {
+        if !self.config.conflict_branch {
+            return Err(SyncError::ManualInterventionRequired {
+                reason: "Rebase conflicts detected. Please resolve manually.".to_string(),
+            });
+        }
+
+        info!("Conflict detected with conflict_branch enabled, creating fallback branch");
+
+        // Create fallback branch from current state
+        let fallback_branch = self.create_fallback_branch()?;
+
+        // Commit any uncommitted changes on the fallback branch
+        if self.has_local_changes()? {
+            self.auto_commit()?;
+        }
+
+        // Push the fallback branch
+        self.push_branch(&fallback_branch)?;
+
+        info!(
+            "Switched to fallback branch {} due to conflicts. \
+             Will automatically return to target branch when conflicts are resolved.",
+            fallback_branch
+        );
+
+        Ok(())
+    }
+
     /// Main sync operation
-    pub fn sync(&self, check_only: bool) -> Result<()> {
+    pub fn sync(&mut self, check_only: bool) -> Result<()> {
         info!("Starting sync operation (check_only: {})", check_only);
 
         // Check repository state
@@ -746,13 +1146,23 @@ impl RepositorySynchronizer {
             return Ok(());
         }
 
+        // Fetch from remote first (needed for both normal sync and return-to-target check)
+        self.fetch()?;
+
+        // If we're on a fallback branch and conflict_branch is enabled,
+        // try to return to the target branch
+        if self.config.conflict_branch
+            && self.is_on_fallback_branch()?
+            && self.try_return_to_target()?
+        {
+            // Successfully returned to target, update branch name for sync state check
+            info!("Returned to target branch, continuing with normal sync");
+        }
+
         // Auto-commit if there are local changes
         if self.has_local_changes()? {
             self.auto_commit()?;
         }
-
-        // Fetch from remote
-        self.fetch()?;
 
         // Get sync state and handle accordingly
         let sync_state = self.get_sync_state()?;
@@ -771,19 +1181,31 @@ impl RepositorySynchronizer {
             SyncState::Diverged { .. } => {
                 info!("Branches have diverged, rebasing");
                 self.rebase()?;
-                // After successful rebase, push the changes
+                // After successful rebase (or fallback branch creation), push the changes
+                // Note: if we switched to a fallback branch, we need to update our branch name
+                let current_branch = self.get_current_branch()?;
+                if current_branch != self.config.branch_name {
+                    self.config.branch_name = current_branch;
+                }
                 self.push()?;
             }
             SyncState::NoUpstream => {
-                return Err(SyncError::NoRemoteConfigured {
-                    branch: self.config.branch_name.clone(),
-                });
+                // If we're on a fallback branch that doesn't have upstream yet, push it
+                if self.is_on_fallback_branch()? {
+                    info!("Fallback branch has no upstream, pushing");
+                    let branch = self.get_current_branch()?;
+                    self.push_branch(&branch)?;
+                } else {
+                    return Err(SyncError::NoRemoteConfigured {
+                        branch: self.config.branch_name.clone(),
+                    });
+                }
             }
         }
 
-        // Verify we're in sync
+        // Verify we're in sync (skip for fallback branches that may not have upstream yet)
         let final_state = self.get_sync_state()?;
-        if final_state != SyncState::Equal {
+        if final_state != SyncState::Equal && final_state != SyncState::NoUpstream {
             warn!(
                 "Sync completed but repository is not in sync: {:?}",
                 final_state

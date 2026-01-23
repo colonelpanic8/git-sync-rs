@@ -35,9 +35,11 @@ fn uncommitted_changes_during_sync() -> Result<()> {
         commit_message: Some("Auto-commit and sync".to_string()),
         remote_name: "origin".to_string(),
         branch_name: "master".to_string(),
+        conflict_branch: false,
+        target_branch: None,
     };
 
-    let sync = RepositorySynchronizer::new_with_detected_branch(&setup.local_path, config)?;
+    let mut sync = RepositorySynchronizer::new_with_detected_branch(&setup.local_path, config)?;
     sync.sync(false)?;
 
     // Should have committed local changes and pulled remote

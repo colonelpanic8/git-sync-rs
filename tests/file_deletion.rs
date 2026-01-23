@@ -31,9 +31,11 @@ fn handle_file_deleted_remotely() -> Result<()> {
         commit_message: Some("Sync deletion conflict".to_string()),
         remote_name: "origin".to_string(),
         branch_name: "master".to_string(),
+        conflict_branch: false,
+        target_branch: None,
     };
 
-    let sync = RepositorySynchronizer::new_with_detected_branch(&setup.local_path, config)?;
+    let mut sync = RepositorySynchronizer::new_with_detected_branch(&setup.local_path, config)?;
     let _result = sync.sync(false);
 
     // File should exist (local changes preserved) or not (remote deletion wins)

@@ -32,9 +32,11 @@ fn basic_sync() -> Result<()> {
         commit_message: Some("Sync: {hostname} at {timestamp}".to_string()),
         remote_name: "origin".to_string(),
         branch_name: "master".to_string(),
+        conflict_branch: false,
+        target_branch: None,
     };
 
-    let synchronizer =
+    let mut synchronizer =
         RepositorySynchronizer::new_with_detected_branch(&setup.local_path, sync_config)?;
     synchronizer.sync(false)?;
 

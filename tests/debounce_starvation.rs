@@ -26,6 +26,8 @@ async fn continuous_changes_starve_debounce() -> Result<()> {
         commit_message: Some("Auto-sync: {hostname} at {timestamp}".to_string()),
         remote_name: "origin".to_string(),
         branch_name: "master".to_string(),
+        conflict_branch: false,
+        target_branch: None,
     };
 
     let watch_config = WatchConfig {
