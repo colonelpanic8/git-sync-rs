@@ -35,6 +35,7 @@ async fn continuous_changes_starve_debounce() -> Result<()> {
         min_interval_ms: 200,
         sync_on_start: false,
         dry_run: false,
+        ..Default::default()
     };
 
     let local_path = setup.local_path.clone();

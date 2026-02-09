@@ -1,6 +1,8 @@
 pub mod config;
 pub mod error;
 pub mod sync;
+#[cfg(feature = "tray")]
+pub mod tray;
 pub mod watch;
 
 pub use config::{Config, ConfigLoader, DefaultConfig, RepositoryConfig};

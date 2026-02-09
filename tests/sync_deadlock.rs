@@ -43,6 +43,7 @@ async fn sync_stuck_after_error_during_watch() -> Result<()> {
         min_interval_ms: 200,
         sync_on_start: false,
         dry_run: false,
+        ..Default::default()
     };
 
     let local_path = setup.local_path.clone();

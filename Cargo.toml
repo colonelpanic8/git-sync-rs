@@ -1,6 +1,6 @@
 [package]
 name = "git-sync-rs"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2021"
 description = "Automatic git repository synchronization with file watching"
 license = "MIT OR Apache-2.0"
@@ -26,6 +26,10 @@ serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 directories = "5.0"
 shellexpand = "3.0"
+ksni = { version = "0.3", optional = true }
+
+[features]
+tray = ["ksni"]
 
 [dev-dependencies]
 tempfile = "3.0"

@@ -1,6 +1,10 @@
 use crate::error::{Result, SyncError};
 use crate::sync::{RepositorySynchronizer, SyncConfig};
+#[cfg(feature = "tray")]
+use crate::tray::{GitSyncTray, TrayCommand, TrayState, TrayStatus};
 use git2::Repository;
+#[cfg(feature = "tray")]
+use ksni::TrayMethods;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,6 +28,9 @@ pub struct WatchConfig {
 
     /// Dry run mode - detect changes but don't sync
     pub dry_run: bool,
+
+    /// Enable system tray indicator (requires `tray` feature)
+    pub enable_tray: bool,
 }
 
 impl Default for WatchConfig {
@@ -33,6 +40,7 @@ impl Default for WatchConfig {
             min_interval_ms: 1000,
             sync_on_start: true,
             dry_run: false,
+            enable_tray: false,
         }
     }
 }
@@ -242,16 +250,168 @@ impl WatchManager {
         let mut interval = time::interval(Duration::from_millis(tick_ms));
         interval.tick().await; // align first tick
 
+        #[cfg(feature = "tray")]
+        if self.watch_config.enable_tray {
+            return self
+                .process_events_with_tray(&mut rx, &mut sync_state, &mut interval)
+                .await;
+        }
+
+        self.process_events_loop(&mut rx, &mut sync_state, &mut interval, false)
+            .await
+    }
+
+    /// Core event loop without tray
+    async fn process_events_loop(
+        &self,
+        rx: &mut mpsc::Receiver<Event>,
+        sync_state: &mut SyncState,
+        interval: &mut time::Interval,
+        paused: bool,
+    ) -> Result<()> {
         loop {
             tokio::select! {
                 biased;
-                // Give the interval a chance first to avoid starvation
                 _ = interval.tick() => {
-                    self.handle_timeout(&mut sync_state).await;
+                    if !paused {
+                        self.handle_timeout(sync_state).await;
+                    }
                 }
                 Some(event) = rx.recv() => {
-                    self.handle_file_event(event, &mut sync_state);
+                    if !paused {
+                        self.handle_file_event(event, sync_state);
+                    }
                 }
+            }
+        }
+    }
+
+    /// Event loop with tray integration
+    #[cfg(feature = "tray")]
+    async fn process_events_with_tray(
+        &self,
+        rx: &mut mpsc::Receiver<Event>,
+        sync_state: &mut SyncState,
+        interval: &mut time::Interval,
+    ) -> Result<()> {
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let tray_state = TrayState::new(PathBuf::from(&self.repo_path));
+        let tray = GitSyncTray::new(tray_state, cmd_tx);
+
+        let handle = tray
+            .spawn()
+            .await
+            .map_err(|e| SyncError::Other(format!("Failed to spawn tray: {}", e)))?;
+        info!("System tray indicator started");
+
+        let mut paused = false;
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = interval.tick() => {
+                    if !paused {
+                        self.handle_timeout_with_tray(sync_state, &handle).await;
+                    }
+                }
+                Some(event) = rx.recv() => {
+                    if !paused {
+                        self.handle_file_event(event, sync_state);
+                    }
+                }
+                Some(cmd) = cmd_rx.recv() => {
+                    match cmd {
+                        TrayCommand::SyncNow => {
+                            info!("Tray: manual sync requested");
+                            self.do_sync_with_tray_update(sync_state, &handle).await;
+                        }
+                        TrayCommand::Pause => {
+                            info!("Tray: pausing sync");
+                            paused = true;
+                            let _ = handle.update(|t: &mut GitSyncTray| {
+                                t.state.paused = true;
+                            }).await;
+                        }
+                        TrayCommand::Resume => {
+                            info!("Tray: resuming sync");
+                            paused = false;
+                            let _ = handle.update(|t: &mut GitSyncTray| {
+                                t.state.paused = false;
+                            }).await;
+                        }
+                        TrayCommand::Quit => {
+                            info!("Tray: quit requested");
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Handle timeout with tray state updates
+    #[cfg(feature = "tray")]
+    async fn handle_timeout_with_tray(
+        &self,
+        sync_state: &mut SyncState,
+        handle: &ksni::Handle<GitSyncTray>,
+    ) {
+        if !sync_state.should_sync() {
+            return;
+        }
+
+        if self.is_syncing.load(Ordering::Acquire) {
+            debug!("Sync already in progress, skipping");
+            return;
+        }
+
+        self.do_sync_with_tray_update(sync_state, handle).await;
+    }
+
+    /// Perform sync and update tray state accordingly
+    #[cfg(feature = "tray")]
+    async fn do_sync_with_tray_update(
+        &self,
+        sync_state: &mut SyncState,
+        handle: &ksni::Handle<GitSyncTray>,
+    ) {
+        let _ = handle
+            .update(|t: &mut GitSyncTray| {
+                t.state.status = TrayStatus::Syncing;
+            })
+            .await;
+
+        let span = tracing::info_span!(
+            "perform_sync_attempt",
+            repo = %self.repo_path,
+            branch = %self.sync_config.branch_name,
+            remote = %self.sync_config.remote_name,
+            dry_run = self.watch_config.dry_run
+        );
+        let _guard = span.enter();
+
+        match self.perform_sync().await {
+            Ok(()) => {
+                debug!("perform_sync succeeded");
+                sync_state.record_sync();
+                let now = std::time::Instant::now();
+                let _ = handle
+                    .update(move |t: &mut GitSyncTray| {
+                        t.state.status = TrayStatus::Idle;
+                        t.state.last_sync = Some(now);
+                        t.state.last_error = None;
+                    })
+                    .await;
+            }
+            Err(e) => {
+                let err_msg = e.to_string();
+                self.log_sync_error(&e);
+                let _ = handle
+                    .update(move |t: &mut GitSyncTray| {
+                        t.state.status = TrayStatus::Error(err_msg.clone());
+                        t.state.last_error = Some(err_msg);
+                    })
+                    .await;
             }
         }
     }
@@ -299,7 +459,6 @@ impl WatchManager {
         }
 
         info!("Changes detected, triggering sync");
-        // Attach a span with useful fields for diagnostics
         let span = tracing::info_span!(
             "perform_sync_attempt",
             repo = %self.repo_path,
@@ -310,45 +469,47 @@ impl WatchManager {
         let _guard = span.enter();
         match self.perform_sync().await {
             Ok(()) => {
-                // Only record successful syncs
                 debug!("perform_sync succeeded");
                 sync_state.record_sync();
             }
             Err(e) => {
-                // Do not clear pending flag on failure; allow retry
-                match &e {
-                    SyncError::DetachedHead => error!(
-                        "Sync failed: detached HEAD. Repository must be on a branch; will retry."
-                    ),
-                    SyncError::UnsafeRepositoryState { state } => error!(
-                        state = %state,
-                        "Sync failed: repository in unsafe state; will retry"
-                    ),
-                    SyncError::ManualInterventionRequired { reason } => warn!(
-                        reason = %reason,
-                        "Sync requires manual intervention; pending will remain set"
-                    ),
-                    SyncError::NoRemoteConfigured { branch } => error!(
-                        branch = %branch,
-                        "Sync failed: no remote configured for branch"
-                    ),
-                    SyncError::NetworkError(msg) => error!(
-                        error = %msg,
-                        "Network error during sync; will retry"
-                    ),
-                    SyncError::TaskError(msg) => error!(
-                        error = %msg,
-                        "Background task error during sync; will retry"
-                    ),
-                    SyncError::GitError(err) => error!(
-                        code = ?err.code(),
-                        klass = ?err.class(),
-                        message = %err.message(),
-                        "Git error during sync; will retry"
-                    ),
-                    other => error!(error = %other, "Sync failed; will retry"),
-                }
+                self.log_sync_error(&e);
             }
+        }
+    }
+
+    fn log_sync_error(&self, e: &SyncError) {
+        match e {
+            SyncError::DetachedHead => error!(
+                "Sync failed: detached HEAD. Repository must be on a branch; will retry."
+            ),
+            SyncError::UnsafeRepositoryState { state } => error!(
+                state = %state,
+                "Sync failed: repository in unsafe state; will retry"
+            ),
+            SyncError::ManualInterventionRequired { reason } => warn!(
+                reason = %reason,
+                "Sync requires manual intervention; pending will remain set"
+            ),
+            SyncError::NoRemoteConfigured { branch } => error!(
+                branch = %branch,
+                "Sync failed: no remote configured for branch"
+            ),
+            SyncError::NetworkError(msg) => error!(
+                error = %msg,
+                "Network error during sync; will retry"
+            ),
+            SyncError::TaskError(msg) => error!(
+                error = %msg,
+                "Background task error during sync; will retry"
+            ),
+            SyncError::GitError(err) => error!(
+                code = ?err.code(),
+                klass = ?err.class(),
+                message = %err.message(),
+                "Git error during sync; will retry"
+            ),
+            other => error!(error = %other, "Sync failed; will retry"),
         }
     }
 

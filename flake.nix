@@ -17,6 +17,44 @@
         pkgs = import nixpkgs {
           inherit system overlays;
         };
+        commonBuildInputs = with pkgs;
+          [
+            openssl
+            libgit2
+          ]
+          ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+            darwin.apple_sdk.frameworks.Security
+            darwin.apple_sdk.frameworks.CoreFoundation
+            darwin.apple_sdk.frameworks.SystemConfiguration
+          ];
+
+        commonEnv = {
+          PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig";
+          OPENSSL_DIR = "${pkgs.openssl.dev}";
+          OPENSSL_LIB_DIR = "${pkgs.openssl.out}/lib";
+          OPENSSL_INCLUDE_DIR = "${pkgs.openssl.dev}/include";
+        };
+
+        mkGitSyncPackage = { pname, buildFeatures ? [], extraBuildInputs ? [], extraNativeBuildInputs ? [] }:
+          pkgs.rustPlatform.buildRustPackage ({
+            inherit pname;
+            version = "0.4.0";
+
+            src = ./.;
+
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+            };
+
+            inherit buildFeatures;
+
+            nativeBuildInputs = with pkgs; [
+              pkg-config
+              git
+            ] ++ extraNativeBuildInputs;
+
+            buildInputs = commonBuildInputs ++ extraBuildInputs;
+          } // commonEnv);
       in {
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs;
@@ -26,6 +64,7 @@
               openssl
               git
               libgit2
+              dbus
 
               # Rust toolchain
               (rust-bin.stable.latest.default.override {
@@ -33,7 +72,6 @@
               })
             ]
             ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
-              # macOS specific dependencies
               darwin.apple_sdk.frameworks.Security
               darwin.apple_sdk.frameworks.CoreFoundation
               darwin.apple_sdk.frameworks.SystemConfiguration
@@ -56,36 +94,18 @@
           '';
         };
 
-        # Package definition
-        packages.default = pkgs.rustPlatform.buildRustPackage {
+        packages.default = mkGitSyncPackage {
           pname = "git-sync-rs";
-          version = "0.1.0";
+        };
 
-          src = ./.;
+        packages.git-sync-rs = mkGitSyncPackage {
+          pname = "git-sync-rs";
+        };
 
-          cargoLock = {
-            lockFile = ./Cargo.lock;
-          };
-
-          nativeBuildInputs = with pkgs; [
-            pkg-config
-          ];
-
-          buildInputs = with pkgs;
-            [
-              openssl
-              libgit2
-            ]
-            ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
-              darwin.apple_sdk.frameworks.Security
-              darwin.apple_sdk.frameworks.CoreFoundation
-              darwin.apple_sdk.frameworks.SystemConfiguration
-            ];
-
-          PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig";
-          OPENSSL_DIR = "${pkgs.openssl.dev}";
-          OPENSSL_LIB_DIR = "${pkgs.openssl.out}/lib";
-          OPENSSL_INCLUDE_DIR = "${pkgs.openssl.dev}/include";
+        packages.git-sync-rs-tray = mkGitSyncPackage {
+          pname = "git-sync-rs-tray";
+          buildFeatures = ["tray"];
+          extraBuildInputs = with pkgs; [dbus];
         };
       }
     );

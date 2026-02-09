@@ -78,6 +78,11 @@ enum Commands {
         /// Don't sync on startup
         #[arg(long)]
         no_initial_sync: bool,
+
+        /// Show system tray indicator (requires tray feature)
+        #[cfg(feature = "tray")]
+        #[arg(long)]
+        tray: bool,
     },
 
     /// Initialize config file with example
@@ -184,10 +189,11 @@ async fn run(cli: Cli) -> Result<()> {
             let config = loader.load()?;
 
             let watch_config = WatchConfig {
-                debounce_ms: 500,      // Default 0.5 seconds
-                min_interval_ms: 1000, // Default 1 second
+                debounce_ms: 500,
+                min_interval_ms: 1000,
                 sync_on_start: true,
-                dry_run: cli.dry_run, // Use global dry_run flag
+                dry_run: cli.dry_run,
+                enable_tray: false,
             };
 
             let interval_ms = Some(config.defaults.sync_interval * 1000);
@@ -213,15 +219,23 @@ async fn run(cli: Cli) -> Result<()> {
             min_interval,
             interval,
             no_initial_sync,
+            #[cfg(feature = "tray")]
+            tray,
         }) => {
             // Load config once
             let config = loader.load()?;
+
+            #[cfg(feature = "tray")]
+            let enable_tray = tray;
+            #[cfg(not(feature = "tray"))]
+            let enable_tray = false;
 
             let watch_config = WatchConfig {
                 debounce_ms: (debounce * 1000.0) as u64,
                 min_interval_ms: (min_interval * 1000.0) as u64,
                 sync_on_start: !no_initial_sync,
-                dry_run: cli.dry_run, // Use global dry_run flag
+                dry_run: cli.dry_run,
+                enable_tray,
             };
 
             // Use interval from CLI or defaults (repo config would need separate loading)
