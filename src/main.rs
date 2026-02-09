@@ -188,12 +188,17 @@ async fn run(cli: Cli) -> Result<()> {
             // Default to watch if no command specified
             let config = loader.load()?;
 
+            #[cfg(feature = "tray")]
+            let enable_tray = env::var("GIT_SYNC_TRAY").is_ok();
+            #[cfg(not(feature = "tray"))]
+            let enable_tray = false;
+
             let watch_config = WatchConfig {
                 debounce_ms: 500,
                 min_interval_ms: 1000,
                 sync_on_start: true,
                 dry_run: cli.dry_run,
-                enable_tray: false,
+                enable_tray,
             };
 
             let interval_ms = Some(config.defaults.sync_interval * 1000);
@@ -226,7 +231,7 @@ async fn run(cli: Cli) -> Result<()> {
             let config = loader.load()?;
 
             #[cfg(feature = "tray")]
-            let enable_tray = tray;
+            let enable_tray = tray || env::var("GIT_SYNC_TRAY").is_ok();
             #[cfg(not(feature = "tray"))]
             let enable_tray = false;
 
