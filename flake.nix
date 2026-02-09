@@ -96,6 +96,8 @@
 
         packages.default = mkGitSyncPackage {
           pname = "git-sync-rs";
+          buildFeatures = ["tray"];
+          extraBuildInputs = with pkgs; [dbus];
         };
 
         packages.git-sync-rs = mkGitSyncPackage {
@@ -103,7 +105,7 @@
         };
 
         packages.git-sync-rs-tray = mkGitSyncPackage {
-          pname = "git-sync-rs-tray";
+          pname = "git-sync-rs";
           buildFeatures = ["tray"];
           extraBuildInputs = with pkgs; [dbus];
         };
