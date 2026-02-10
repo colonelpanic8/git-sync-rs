@@ -330,6 +330,7 @@ impl WatchManager {
                             paused = true;
                             let _ = handle.update(|t: &mut GitSyncTray| {
                                 t.state.paused = true;
+                                t.bump_icon_generation();
                             }).await;
                         }
                         TrayCommand::Resume => {
@@ -337,6 +338,7 @@ impl WatchManager {
                             paused = false;
                             let _ = handle.update(|t: &mut GitSyncTray| {
                                 t.state.paused = false;
+                                t.bump_icon_generation();
                             }).await;
                         }
                         TrayCommand::Quit => {
@@ -375,11 +377,16 @@ impl WatchManager {
         sync_state: &mut SyncState,
         handle: &ksni::Handle<GitSyncTray>,
     ) {
-        let _ = handle
+        info!("Tray: setting status to Syncing");
+        let update_result = handle
             .update(|t: &mut GitSyncTray| {
                 t.state.status = TrayStatus::Syncing;
+                t.bump_icon_generation();
             })
             .await;
+        if update_result.is_none() {
+            warn!("Tray: handle.update (Syncing) returned None - tray service may be dead");
+        }
 
         let span = tracing::info_span!(
             "perform_sync_attempt",
@@ -392,26 +399,35 @@ impl WatchManager {
 
         match self.perform_sync().await {
             Ok(()) => {
-                debug!("perform_sync succeeded");
+                info!("Tray: perform_sync succeeded, setting status to Idle");
                 sync_state.record_sync();
                 let now = std::time::Instant::now();
-                let _ = handle
+                let update_result = handle
                     .update(move |t: &mut GitSyncTray| {
                         t.state.status = TrayStatus::Idle;
                         t.state.last_sync = Some(now);
                         t.state.last_error = None;
+                        t.bump_icon_generation();
                     })
                     .await;
+                if update_result.is_none() {
+                    warn!("Tray: handle.update (Idle) returned None - tray service may be dead");
+                }
             }
             Err(e) => {
                 let err_msg = e.to_string();
                 self.log_sync_error(&e);
-                let _ = handle
+                info!("Tray: perform_sync failed, setting status to Error");
+                let update_result = handle
                     .update(move |t: &mut GitSyncTray| {
                         t.state.status = TrayStatus::Error(err_msg.clone());
                         t.state.last_error = Some(err_msg);
+                        t.bump_icon_generation();
                     })
                     .await;
+                if update_result.is_none() {
+                    warn!("Tray: handle.update (Error) returned None - tray service may be dead");
+                }
             }
         }
     }

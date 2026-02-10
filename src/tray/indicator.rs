@@ -8,11 +8,26 @@ use super::state::{TrayCommand, TrayState, TrayStatus};
 pub struct GitSyncTray {
     pub state: TrayState,
     pub cmd_tx: UnboundedSender<TrayCommand>,
+    /// Counter incremented on each state change to ensure ksni detects
+    /// icon updates even if D-Bus property queries race with the update
+    /// signal processing. Used in `icon_pixmap()` to produce a unique hash.
+    icon_generation: u64,
 }
 
 impl GitSyncTray {
     pub fn new(state: TrayState, cmd_tx: UnboundedSender<TrayCommand>) -> Self {
-        Self { state, cmd_tx }
+        Self {
+            state,
+            cmd_tx,
+            icon_generation: 0,
+        }
+    }
+
+    /// Bump the icon generation counter to force ksni to emit a NewIcon signal
+    /// on the next update, even if a D-Bus property query race would otherwise
+    /// cause the icon_name change to go undetected.
+    pub fn bump_icon_generation(&mut self) {
+        self.icon_generation = self.icon_generation.wrapping_add(1);
     }
 
     fn icon_for_status(&self) -> &str {
@@ -35,6 +50,24 @@ impl ksni::Tray for GitSyncTray {
 
     fn icon_name(&self) -> String {
         self.icon_for_status().into()
+    }
+
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        // Return a unique 1x1 transparent pixmap whose data varies with
+        // icon_generation.  Tray hosts prefer icon_name over icon_pixmap,
+        // so this pixel is never displayed.  Its purpose is to ensure
+        // ksni's property-change detector sees a hash difference and emits
+        // a NewIcon D-Bus signal, even when a race condition causes the
+        // icon_name change to go undetected.
+        let gen = self.icon_generation;
+        let r = (gen & 0xFF) as u8;
+        let g = ((gen >> 8) & 0xFF) as u8;
+        let b = ((gen >> 16) & 0xFF) as u8;
+        vec![ksni::Icon {
+            width: 1,
+            height: 1,
+            data: vec![0, r, g, b], // ARGB: fully transparent
+        }]
     }
 
     fn title(&self) -> String {
