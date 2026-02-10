@@ -44,6 +44,8 @@ impl GitSyncTray {
 }
 
 impl ksni::Tray for GitSyncTray {
+    const MENU_ON_ACTIVATE: bool = true;
+
     fn id(&self) -> String {
         "git-sync-rs".into()
     }
