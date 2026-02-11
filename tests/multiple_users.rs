@@ -35,7 +35,8 @@ fn multiple_users_concurrent_changes() -> Result<()> {
         target_branch: None,
     };
 
-    let mut sync = RepositorySynchronizer::new_with_detected_branch(&setup.local_path, config.clone())?;
+    let mut sync =
+        RepositorySynchronizer::new_with_detected_branch(&setup.local_path, config.clone())?;
     sync.sync(false)?;
 
     // User3 tries to push (should fail, needs to pull first)

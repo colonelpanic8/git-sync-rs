@@ -496,9 +496,9 @@ impl WatchManager {
 
     fn log_sync_error(&self, e: &SyncError) {
         match e {
-            SyncError::DetachedHead => error!(
-                "Sync failed: detached HEAD. Repository must be on a branch; will retry."
-            ),
+            SyncError::DetachedHead => {
+                error!("Sync failed: detached HEAD. Repository must be on a branch; will retry.")
+            }
             SyncError::UnsafeRepositoryState { state } => error!(
                 state = %state,
                 "Sync failed: repository in unsafe state; will retry"

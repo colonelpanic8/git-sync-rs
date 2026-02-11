@@ -365,7 +365,10 @@ impl RepositorySynchronizer {
 
     /// Fetch a specific branch from remote
     pub fn fetch_branch(&self, branch: &str) -> Result<()> {
-        info!("Fetching branch {} from remote: {}", branch, self.config.remote_name);
+        info!(
+            "Fetching branch {} from remote: {}",
+            branch, self.config.remote_name
+        );
 
         use std::process::Command;
 
@@ -774,10 +777,7 @@ impl RepositorySynchronizer {
 
         // Fallback: check if main or master exists
         if self.repo.find_branch("main", BranchType::Local).is_ok()
-            || self
-                .repo
-                .find_reference("refs/remotes/origin/main")
-                .is_ok()
+            || self.repo.find_reference("refs/remotes/origin/main").is_ok()
         {
             debug!("Falling back to 'main' as default branch");
             return Ok("main".to_string());
@@ -844,9 +844,7 @@ impl RepositorySynchronizer {
         checkout_builder.force();
         self.repo
             .checkout_head(Some(&mut checkout_builder))
-            .map_err(|e| {
-                SyncError::Other(format!("Failed to checkout fallback branch: {}", e))
-            })?;
+            .map_err(|e| SyncError::Other(format!("Failed to checkout fallback branch: {}", e)))?;
 
         info!("Switched to fallback branch: {}", branch_name);
         Ok(branch_name)
@@ -912,10 +910,7 @@ impl RepositorySynchronizer {
             .map_err(|e| SyncError::Other(format!("Failed to perform merge check: {}", e)))?;
 
         let has_conflicts = index.has_conflicts();
-        debug!(
-            "In-memory merge check: has_conflicts={}",
-            has_conflicts
-        );
+        debug!("In-memory merge check: has_conflicts={}", has_conflicts);
 
         Ok(!has_conflicts)
     }
@@ -978,9 +973,11 @@ impl RepositorySynchronizer {
 
         // Get current branch commits that need to be rebased onto target
         let current_branch = self.get_current_branch()?;
-        let current_oid = self.repo.head()?.target().ok_or_else(|| {
-            SyncError::Other("Current HEAD has no OID".to_string())
-        })?;
+        let current_oid = self
+            .repo
+            .head()?
+            .target()
+            .ok_or_else(|| SyncError::Other("Current HEAD has no OID".to_string()))?;
 
         // Find merge base between our fallback branch and target
         let merge_base = self.repo.merge_base(current_oid, target_oid)?;
@@ -993,11 +990,12 @@ impl RepositorySynchronizer {
         let target_ref = format!("refs/heads/{}", target_branch);
 
         // First, make sure local target branch exists and is up to date
-        let remote_target_ref = format!("refs/remotes/{}/{}", self.config.remote_name, target_branch);
+        let remote_target_ref =
+            format!("refs/remotes/{}/{}", self.config.remote_name, target_branch);
         let remote_target = self.repo.find_reference(&remote_target_ref)?;
-        let remote_target_oid = remote_target.target().ok_or_else(|| {
-            SyncError::Other("Remote target has no OID".to_string())
-        })?;
+        let remote_target_oid = remote_target
+            .target()
+            .ok_or_else(|| SyncError::Other("Remote target has no OID".to_string()))?;
 
         // Update or create local target branch
         if self.repo.find_reference(&target_ref).is_ok() {
@@ -1033,7 +1031,9 @@ impl RepositorySynchronizer {
             // Get the commits from the fallback branch
             let fallback_ref = format!("refs/heads/{}", current_branch);
             let fallback_reference = self.repo.find_reference(&fallback_ref)?;
-            let fallback_annotated = self.repo.reference_to_annotated_commit(&fallback_reference)?;
+            let fallback_annotated = self
+                .repo
+                .reference_to_annotated_commit(&fallback_reference)?;
 
             let target_reference = self.repo.find_reference(&target_ref)?;
             let target_annotated = self.repo.reference_to_annotated_commit(&target_reference)?;

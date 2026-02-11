@@ -65,7 +65,10 @@ fn conflict_branch_disabled_by_default() -> Result<()> {
     let result = sync.sync(false);
 
     // Should fail with manual intervention required
-    assert!(result.is_err(), "Sync should fail when conflict_branch is disabled");
+    assert!(
+        result.is_err(),
+        "Sync should fail when conflict_branch is disabled"
+    );
 
     // Should still be on master
     let branch = get_current_branch(&setup.local_path)?;
@@ -109,7 +112,11 @@ fn conflict_branch_creates_fallback_on_conflict() -> Result<()> {
     let result = sync.sync(false);
 
     // Should succeed (switched to fallback branch)
-    assert!(result.is_ok(), "Sync should succeed with conflict_branch enabled: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Sync should succeed with conflict_branch enabled: {:?}",
+        result
+    );
 
     // Should be on a fallback branch
     let branch = get_current_branch(&setup.local_path)?;
@@ -127,7 +134,10 @@ fn conflict_branch_creates_fallback_on_conflict() -> Result<()> {
 
     // Local changes should be preserved
     let content = fs::read_to_string(setup.local_path.join("data.txt"))?;
-    assert!(content.contains("LOCAL"), "Local changes should be preserved");
+    assert!(
+        content.contains("LOCAL"),
+        "Local changes should be preserved"
+    );
 
     Ok(())
 }
@@ -163,7 +173,8 @@ fn conflict_branch_returns_to_target_after_resolution() -> Result<()> {
         target_branch: Some("master".to_string()),
     };
 
-    let mut sync = RepositorySynchronizer::new_with_detected_branch(&setup.local_path, config.clone())?;
+    let mut sync =
+        RepositorySynchronizer::new_with_detected_branch(&setup.local_path, config.clone())?;
     sync.sync(false)?;
 
     let fallback_branch = get_current_branch(&setup.local_path)?;
@@ -190,7 +201,12 @@ fn conflict_branch_returns_to_target_after_resolution() -> Result<()> {
 
     Command::new("git")
         .current_dir(&second)
-        .args(["merge", "-X", "theirs", &format!("origin/{}", fallback_branch)])
+        .args([
+            "merge",
+            "-X",
+            "theirs",
+            &format!("origin/{}", fallback_branch),
+        ])
         .status()?;
 
     setup.push_from(&second)?;
@@ -201,7 +217,10 @@ fn conflict_branch_returns_to_target_after_resolution() -> Result<()> {
 
     // Should be back on master
     let branch = get_current_branch(&setup.local_path)?;
-    assert_eq!(branch, "master", "Should have returned to master after resolution");
+    assert_eq!(
+        branch, "master",
+        "Should have returned to master after resolution"
+    );
 
     Ok(())
 }
@@ -237,7 +256,8 @@ fn conflict_branch_stays_on_fallback_when_still_conflicting() -> Result<()> {
         target_branch: Some("master".to_string()),
     };
 
-    let mut sync = RepositorySynchronizer::new_with_detected_branch(&setup.local_path, config.clone())?;
+    let mut sync =
+        RepositorySynchronizer::new_with_detected_branch(&setup.local_path, config.clone())?;
     sync.sync(false)?;
 
     let fallback_branch = get_current_branch(&setup.local_path)?;
