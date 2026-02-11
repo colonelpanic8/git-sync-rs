@@ -31,6 +31,9 @@ pub struct WatchConfig {
 
     /// Enable system tray indicator (requires `tray` feature)
     pub enable_tray: bool,
+
+    /// Custom tray icon: a freedesktop icon name or a path to an image file
+    pub tray_icon: Option<String>,
 }
 
 impl Default for WatchConfig {
@@ -41,6 +44,7 @@ impl Default for WatchConfig {
             sync_on_start: true,
             dry_run: false,
             enable_tray: false,
+            tray_icon: None,
         }
     }
 }
@@ -296,7 +300,7 @@ impl WatchManager {
     ) -> Result<()> {
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let tray_state = TrayState::new(PathBuf::from(&self.repo_path));
-        let tray = GitSyncTray::new(tray_state, cmd_tx);
+        let tray = GitSyncTray::new(tray_state, cmd_tx, self.watch_config.tray_icon.clone());
 
         let handle = tray
             .spawn()

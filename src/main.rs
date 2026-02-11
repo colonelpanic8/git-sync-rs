@@ -83,6 +83,11 @@ enum Commands {
         #[cfg(feature = "tray")]
         #[arg(long)]
         tray: bool,
+
+        /// Custom tray icon: a freedesktop icon name (e.g. "git") or path to an image file
+        #[cfg(feature = "tray")]
+        #[arg(long)]
+        tray_icon: Option<String>,
     },
 
     /// Initialize config file with example
@@ -193,12 +198,15 @@ async fn run(cli: Cli) -> Result<()> {
             #[cfg(not(feature = "tray"))]
             let enable_tray = false;
 
+            let tray_icon = env::var("GIT_SYNC_TRAY_ICON").ok();
+
             let watch_config = WatchConfig {
                 debounce_ms: 500,
                 min_interval_ms: 1000,
                 sync_on_start: true,
                 dry_run: cli.dry_run,
                 enable_tray,
+                tray_icon,
             };
 
             let interval_ms = Some(config.defaults.sync_interval * 1000);
@@ -226,6 +234,8 @@ async fn run(cli: Cli) -> Result<()> {
             no_initial_sync,
             #[cfg(feature = "tray")]
             tray,
+            #[cfg(feature = "tray")]
+            tray_icon,
         }) => {
             // Load config once
             let config = loader.load()?;
@@ -235,12 +245,18 @@ async fn run(cli: Cli) -> Result<()> {
             #[cfg(not(feature = "tray"))]
             let enable_tray = false;
 
+            #[cfg(feature = "tray")]
+            let tray_icon = tray_icon.or_else(|| env::var("GIT_SYNC_TRAY_ICON").ok());
+            #[cfg(not(feature = "tray"))]
+            let tray_icon: Option<String> = None;
+
             let watch_config = WatchConfig {
                 debounce_ms: (debounce * 1000.0) as u64,
                 min_interval_ms: (min_interval * 1000.0) as u64,
                 sync_on_start: !no_initial_sync,
                 dry_run: cli.dry_run,
                 enable_tray,
+                tray_icon,
             };
 
             // Use interval from CLI or defaults (repo config would need separate loading)

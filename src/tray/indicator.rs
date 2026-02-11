@@ -1,5 +1,6 @@
 use ksni::menu::*;
 use ksni::MenuItem;
+use std::path::Path;
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::state::{TrayCommand, TrayState, TrayStatus};
@@ -53,11 +54,28 @@ struct OverlayIcons {
     pause: Vec<ksni::Icon>,
 }
 
+/// How the base icon is resolved.
+#[derive(Debug, Clone)]
+enum IconSource {
+    /// Use the bundled git icon pixmaps (default).
+    Bundled,
+    /// Use a freedesktop icon name resolved from the system icon theme.
+    Name(String),
+    /// Use a file path: `icon_theme_path` is set to the parent directory
+    /// and `icon_name` to the file stem, letting the SNI host resolve it.
+    Path {
+        icon_theme_path: String,
+        icon_name: String,
+    },
+}
+
 #[derive(Debug)]
 pub struct GitSyncTray {
     pub state: TrayState,
     pub cmd_tx: UnboundedSender<TrayCommand>,
-    /// Decoded main icon pixmaps (computed once at startup).
+    /// How the base icon is provided to the tray.
+    icon_source: IconSource,
+    /// Decoded main icon pixmaps (only used when icon_source is Bundled).
     icons: Vec<ksni::Icon>,
     /// Decoded overlay icon pixmaps per status (computed once at startup).
     overlays: OverlayIcons,
@@ -75,11 +93,44 @@ impl std::fmt::Debug for OverlayIcons {
 }
 
 impl GitSyncTray {
-    pub fn new(state: TrayState, cmd_tx: UnboundedSender<TrayCommand>) -> Self {
+    pub fn new(
+        state: TrayState,
+        cmd_tx: UnboundedSender<TrayCommand>,
+        custom_icon: Option<String>,
+    ) -> Self {
+        let icon_source = match custom_icon {
+            Some(value) => {
+                let path = Path::new(&value);
+                if path.is_absolute() || value.contains('/') || value.contains('.') {
+                    let parent = path
+                        .parent()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    let stem = path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| value.clone());
+                    IconSource::Path {
+                        icon_theme_path: parent,
+                        icon_name: stem,
+                    }
+                } else {
+                    IconSource::Name(value)
+                }
+            }
+            None => IconSource::Bundled,
+        };
+
+        let icons = match &icon_source {
+            IconSource::Bundled => load_icon_set(ICON_32_PNG, ICON_48_PNG, ICON_64_PNG),
+            _ => Vec::new(),
+        };
+
         Self {
             state,
             cmd_tx,
-            icons: load_icon_set(ICON_32_PNG, ICON_48_PNG, ICON_64_PNG),
+            icon_source,
+            icons,
             overlays: OverlayIcons {
                 sync: load_icon_set(OVERLAY_SYNC_32, OVERLAY_SYNC_48, OVERLAY_SYNC_64),
                 error: load_icon_set(OVERLAY_ERROR_32, OVERLAY_ERROR_48, OVERLAY_ERROR_64),
@@ -137,6 +188,23 @@ impl ksni::Tray for GitSyncTray {
 
     fn id(&self) -> String {
         "git-sync-rs".into()
+    }
+
+    fn icon_name(&self) -> String {
+        match &self.icon_source {
+            IconSource::Bundled => String::new(),
+            IconSource::Name(name) => name.clone(),
+            IconSource::Path { icon_name, .. } => icon_name.clone(),
+        }
+    }
+
+    fn icon_theme_path(&self) -> String {
+        match &self.icon_source {
+            IconSource::Path {
+                icon_theme_path, ..
+            } => icon_theme_path.clone(),
+            _ => String::new(),
+        }
     }
 
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
