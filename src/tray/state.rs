@@ -10,7 +10,7 @@ pub struct TrayState {
     pub paused: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrayStatus {
     Idle,
     Syncing,

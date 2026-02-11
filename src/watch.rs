@@ -7,10 +7,16 @@ use git2::Repository;
 use ksni::TrayMethods;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::{Path, PathBuf};
+#[cfg(feature = "tray")]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
+#[cfg(feature = "tray")]
+use tokio::sync::watch as tokio_watch;
+#[cfg(feature = "tray")]
+use tokio::sync::RwLock;
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
@@ -59,6 +65,12 @@ pub struct WatchManager {
     watch_config: WatchConfig,
     is_syncing: Arc<AtomicBool>,
     last_successful_sync_unix_secs: Arc<AtomicI64>,
+    #[cfg(feature = "tray")]
+    last_sync_error: Arc<RwLock<Option<String>>>,
+    #[cfg(feature = "tray")]
+    sync_state_change_tx: tokio_watch::Sender<u64>,
+    #[cfg(feature = "tray")]
+    sync_state_change_seq: Arc<AtomicU64>,
 }
 
 /// Event handler for file system changes
@@ -194,6 +206,8 @@ impl WatchManager {
         // Expand tilde in path
         let path_str = repo_path.as_ref().to_string_lossy();
         let expanded = shellexpand::tilde(&path_str).to_string();
+        #[cfg(feature = "tray")]
+        let (sync_state_change_tx, _) = tokio_watch::channel(0);
 
         Self {
             repo_path: expanded,
@@ -201,6 +215,12 @@ impl WatchManager {
             watch_config,
             is_syncing: Arc::new(AtomicBool::new(false)),
             last_successful_sync_unix_secs: Arc::new(AtomicI64::new(0)),
+            #[cfg(feature = "tray")]
+            last_sync_error: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "tray")]
+            sync_state_change_tx,
+            #[cfg(feature = "tray")]
+            sync_state_change_seq: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -317,6 +337,7 @@ impl WatchManager {
             tokio::task::JoinHandle<std::result::Result<ksni::Handle<GitSyncTray>, ksni::Error>>,
         > = None;
         let mut dbus_bus_watch = Self::setup_dbus_session_bus_watch();
+        let mut sync_state_change_rx = self.sync_state_change_tx.subscribe();
 
         loop {
             tokio::select! {
@@ -331,7 +352,11 @@ impl WatchManager {
                                     tray_handle = Some(handle);
                                     tray_next_attempt = time::Instant::now();
                                     // Ensure the tray reflects current state even if it changed during spawn.
-                                    self.tray_apply_state(&mut tray_handle, &tray_state).await;
+                                    self.reconcile_tray_state_from_global(
+                                        &mut tray_state,
+                                        &mut tray_handle,
+                                    )
+                                    .await;
                                 }
                                 Ok(Err(e)) => {
                                     warn!(
@@ -368,7 +393,7 @@ impl WatchManager {
                     if !tray_state.paused {
                         self.handle_timeout_with_optional_tray(sync_state, &mut tray_state, &mut tray_handle).await;
                     }
-                    self.refresh_tray_last_sync_from_global(&mut tray_state, &mut tray_handle)
+                    self.reconcile_tray_state_from_global(&mut tray_state, &mut tray_handle)
                         .await;
                 }
                 Some(event) = rx.recv() => {
@@ -429,6 +454,17 @@ impl WatchManager {
                         None => {
                             warn!("D-Bus session bus watcher channel closed; falling back to periodic retry");
                             dbus_bus_watch = None;
+                        }
+                    }
+                }
+                sync_state_change = sync_state_change_rx.changed() => {
+                    match sync_state_change {
+                        Ok(()) => {
+                            self.reconcile_tray_state_from_global(&mut tray_state, &mut tray_handle)
+                                .await;
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Tray sync-state update channel closed");
                         }
                     }
                 }
@@ -577,18 +613,52 @@ impl WatchManager {
     }
 
     #[cfg(feature = "tray")]
-    async fn refresh_tray_last_sync_from_global(
+    async fn reconcile_tray_state_from_global(
         &self,
         tray_state: &mut TrayState,
         tray_handle: &mut Option<ksni::Handle<GitSyncTray>>,
     ) {
-        let latest_sync = self.latest_successful_sync_datetime();
-        if tray_state.last_sync == latest_sync {
-            return;
+        let mut changed = false;
+
+        if !tray_state.paused {
+            let desired_status = self.desired_tray_status().await;
+            if tray_state.status != desired_status {
+                tray_state.status = desired_status.clone();
+                changed = true;
+            }
+
+            let desired_last_error = match desired_status {
+                TrayStatus::Error(msg) => Some(msg),
+                _ => None,
+            };
+            if tray_state.last_error != desired_last_error {
+                tray_state.last_error = desired_last_error;
+                changed = true;
+            }
         }
 
-        tray_state.last_sync = latest_sync;
-        self.tray_apply_state(tray_handle, tray_state).await;
+        let latest_sync = self.latest_successful_sync_datetime();
+        if tray_state.last_sync != latest_sync {
+            tray_state.last_sync = latest_sync;
+            changed = true;
+        }
+
+        if changed {
+            self.tray_apply_state(tray_handle, tray_state).await;
+        }
+    }
+
+    #[cfg(feature = "tray")]
+    async fn desired_tray_status(&self) -> TrayStatus {
+        if self.is_syncing.load(Ordering::Acquire) {
+            return TrayStatus::Syncing;
+        }
+
+        let last_error = self.last_sync_error.read().await.clone();
+        match last_error {
+            Some(msg) => TrayStatus::Error(msg),
+            None => TrayStatus::Idle,
+        }
     }
 
     #[cfg(feature = "tray")]
@@ -599,6 +669,12 @@ impl WatchManager {
         }
         use chrono::TimeZone;
         chrono::Local.timestamp_opt(unix_secs, 0).single()
+    }
+
+    #[cfg(feature = "tray")]
+    fn notify_sync_state_changed(&self) {
+        let seq = self.sync_state_change_seq.fetch_add(1, Ordering::AcqRel) + 1;
+        let _ = self.sync_state_change_tx.send(seq);
     }
 
     /// Handle timeout with optional tray state updates
@@ -649,9 +725,8 @@ impl WatchManager {
                 sync_state.record_sync();
                 tray_state.status = TrayStatus::Idle;
                 tray_state.last_error = None;
-                self.refresh_tray_last_sync_from_global(tray_state, tray_handle)
+                self.reconcile_tray_state_from_global(tray_state, tray_handle)
                     .await;
-                self.tray_apply_state(tray_handle, tray_state).await;
             }
             Err(e) => {
                 let err_msg = e.to_string();
@@ -768,6 +843,8 @@ impl WatchManager {
             debug!("Sync already in progress");
             return Ok(());
         }
+        #[cfg(feature = "tray")]
+        self.notify_sync_state_changed();
 
         // Run the sync and ensure we clear the syncing flag regardless of outcome
         let result: Result<()> = if self.watch_config.dry_run {
@@ -804,6 +881,13 @@ impl WatchManager {
             self.last_successful_sync_unix_secs
                 .store(chrono::Utc::now().timestamp(), Ordering::Release);
         }
+        #[cfg(feature = "tray")]
+        {
+            let mut last_error = self.last_sync_error.write().await;
+            *last_error = result.as_ref().err().map(ToString::to_string);
+        }
+        #[cfg(feature = "tray")]
+        self.notify_sync_state_changed();
 
         if let Err(ref err) = result {
             error!(error = %err, "perform_sync finished with error");
