@@ -395,8 +395,8 @@ impl WatchManager {
                         TrayCommand::Quit => {
                             info!("Tray: quit requested");
                             if let Some(handle) = &tray_handle {
-                                // Best-effort shutdown; ignoring awaiter result.
-                                let _ = handle.shutdown();
+                                // Best-effort shutdown before exiting watch mode.
+                                handle.shutdown().await;
                             }
                             return Ok(());
                         }
