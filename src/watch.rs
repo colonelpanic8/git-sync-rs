@@ -7,7 +7,7 @@ use git2::Repository;
 use ksni::TrayMethods;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -58,6 +58,7 @@ pub struct WatchManager {
     sync_config: SyncConfig,
     watch_config: WatchConfig,
     is_syncing: Arc<AtomicBool>,
+    last_successful_sync_unix_secs: Arc<AtomicI64>,
 }
 
 /// Event handler for file system changes
@@ -199,6 +200,7 @@ impl WatchManager {
             sync_config,
             watch_config,
             is_syncing: Arc::new(AtomicBool::new(false)),
+            last_successful_sync_unix_secs: Arc::new(AtomicI64::new(0)),
         }
     }
 
@@ -366,6 +368,8 @@ impl WatchManager {
                     if !tray_state.paused {
                         self.handle_timeout_with_optional_tray(sync_state, &mut tray_state, &mut tray_handle).await;
                     }
+                    self.refresh_tray_last_sync_from_global(&mut tray_state, &mut tray_handle)
+                        .await;
                 }
                 Some(event) = rx.recv() => {
                     if !tray_state.paused {
@@ -572,6 +576,31 @@ impl WatchManager {
         }
     }
 
+    #[cfg(feature = "tray")]
+    async fn refresh_tray_last_sync_from_global(
+        &self,
+        tray_state: &mut TrayState,
+        tray_handle: &mut Option<ksni::Handle<GitSyncTray>>,
+    ) {
+        let latest_sync = self.latest_successful_sync_datetime();
+        if tray_state.last_sync == latest_sync {
+            return;
+        }
+
+        tray_state.last_sync = latest_sync;
+        self.tray_apply_state(tray_handle, tray_state).await;
+    }
+
+    #[cfg(feature = "tray")]
+    fn latest_successful_sync_datetime(&self) -> Option<chrono::DateTime<chrono::Local>> {
+        let unix_secs = self.last_successful_sync_unix_secs.load(Ordering::Acquire);
+        if unix_secs <= 0 {
+            return None;
+        }
+        use chrono::TimeZone;
+        chrono::Local.timestamp_opt(unix_secs, 0).single()
+    }
+
     /// Handle timeout with optional tray state updates
     #[cfg(feature = "tray")]
     async fn handle_timeout_with_optional_tray(
@@ -619,8 +648,9 @@ impl WatchManager {
                 info!("Tray: perform_sync succeeded, setting status to Idle");
                 sync_state.record_sync();
                 tray_state.status = TrayStatus::Idle;
-                tray_state.last_sync = Some(std::time::Instant::now());
                 tray_state.last_error = None;
+                self.refresh_tray_last_sync_from_global(tray_state, tray_handle)
+                    .await;
                 self.tray_apply_state(tray_handle, tray_state).await;
             }
             Err(e) => {
@@ -769,6 +799,11 @@ impl WatchManager {
 
         // Clear syncing flag (finally-like)
         self.is_syncing.store(false, Ordering::Release);
+
+        if result.is_ok() {
+            self.last_successful_sync_unix_secs
+                .store(chrono::Utc::now().timestamp(), Ordering::Release);
+        }
 
         if let Err(ref err) = result {
             error!(error = %err, "perform_sync finished with error");
