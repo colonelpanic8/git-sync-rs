@@ -2,6 +2,7 @@ use ksni::menu::*;
 use ksni::MenuItem;
 use std::path::Path;
 use tokio::sync::mpsc::UnboundedSender;
+use tracing::{info, warn};
 
 use super::state::{TrayCommand, TrayState, TrayStatus};
 
@@ -305,5 +306,14 @@ impl ksni::Tray for GitSyncTray {
         );
 
         items
+    }
+
+    fn watcher_online(&self) {
+        info!("Tray: StatusNotifierWatcher is online");
+    }
+
+    fn watcher_offline(&self, reason: ksni::OfflineReason) -> bool {
+        warn!(reason = ?reason, "Tray: StatusNotifierWatcher is offline; tray may not be visible yet");
+        true
     }
 }

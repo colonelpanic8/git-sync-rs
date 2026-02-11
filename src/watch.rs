@@ -14,6 +14,9 @@ use tokio::sync::mpsc;
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
+#[cfg(feature = "tray")]
+const TRAY_RETRY_FALLBACK_DELAY: Duration = Duration::from_secs(15);
+
 /// Watch mode configuration
 #[derive(Debug, Clone)]
 pub struct WatchConfig {
@@ -257,7 +260,7 @@ impl WatchManager {
         #[cfg(feature = "tray")]
         if self.watch_config.enable_tray {
             return self
-                .process_events_with_tray(&mut rx, &mut sync_state, &mut interval)
+                .process_events_with_tray_resilient(&mut rx, &mut sync_state, &mut interval)
                 .await;
         }
 
@@ -290,64 +293,138 @@ impl WatchManager {
         }
     }
 
-    /// Event loop with tray integration
+    /// Event loop with tray integration.
+    ///
+    /// This must never fail startup: the tray is best-effort. If we can't connect
+    /// to the graphical session / StatusNotifierWatcher, we keep running headless
+    /// and retry periodically.
     #[cfg(feature = "tray")]
-    async fn process_events_with_tray(
+    async fn process_events_with_tray_resilient(
         &self,
         rx: &mut mpsc::Receiver<Event>,
         sync_state: &mut SyncState,
         interval: &mut time::Interval,
     ) -> Result<()> {
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-        let tray_state = TrayState::new(PathBuf::from(&self.repo_path));
-        let tray = GitSyncTray::new(tray_state, cmd_tx, self.watch_config.tray_icon.clone());
+        let mut tray_state = TrayState::new(PathBuf::from(&self.repo_path));
+        let tray_icon = self.watch_config.tray_icon.clone();
+        let mut tray_handle: Option<ksni::Handle<GitSyncTray>> = None;
 
-        let handle = tray
-            .spawn()
-            .await
-            .map_err(|e| SyncError::Other(format!("Failed to spawn tray: {}", e)))?;
-        info!("System tray indicator started");
-
-        let mut paused = false;
+        let mut tray_next_attempt = time::Instant::now();
+        let mut tray_spawn_task: Option<
+            tokio::task::JoinHandle<std::result::Result<ksni::Handle<GitSyncTray>, ksni::Error>>,
+        > = None;
+        let mut dbus_bus_watch = Self::setup_dbus_session_bus_watch();
 
         loop {
             tokio::select! {
                 biased;
                 _ = interval.tick() => {
-                    if !paused {
-                        self.handle_timeout_with_tray(sync_state, &handle).await;
+                    // If a spawn attempt finished, harvest it (non-blocking: is_finished checked).
+                    if let Some(task) = tray_spawn_task.as_ref() {
+                        if task.is_finished() {
+                            match tray_spawn_task.take().expect("checked Some above").await {
+                                Ok(Ok(handle)) => {
+                                    info!("System tray indicator started");
+                                    tray_handle = Some(handle);
+                                    tray_next_attempt = time::Instant::now();
+                                    // Ensure the tray reflects current state even if it changed during spawn.
+                                    self.tray_apply_state(&mut tray_handle, &tray_state).await;
+                                }
+                                Ok(Err(e)) => {
+                                    warn!(
+                                        error = %e,
+                                        delay_s = TRAY_RETRY_FALLBACK_DELAY.as_secs_f64(),
+                                        "Tray unavailable; will retry"
+                                    );
+                                    tray_next_attempt = time::Instant::now() + TRAY_RETRY_FALLBACK_DELAY;
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        error = %e,
+                                        delay_s = TRAY_RETRY_FALLBACK_DELAY.as_secs_f64(),
+                                        "Tray spawn task failed; will retry"
+                                    );
+                                    tray_next_attempt = time::Instant::now() + TRAY_RETRY_FALLBACK_DELAY;
+                                }
+                            }
+                        }
+                    }
+
+                    // If we don't have a tray yet, and no spawn is in flight, try again when due.
+                    if tray_handle.is_none()
+                        && tray_spawn_task.is_none()
+                        && time::Instant::now() >= tray_next_attempt
+                    {
+                        tray_spawn_task = Some(Self::spawn_tray_task(
+                            tray_state.clone(),
+                            cmd_tx.clone(),
+                            tray_icon.clone(),
+                        ));
+                    }
+
+                    if !tray_state.paused {
+                        self.handle_timeout_with_optional_tray(sync_state, &mut tray_state, &mut tray_handle).await;
                     }
                 }
                 Some(event) = rx.recv() => {
-                    if !paused {
+                    if !tray_state.paused {
                         self.handle_file_event(event, sync_state);
                     }
                 }
                 Some(cmd) = cmd_rx.recv() => {
                     match cmd {
                         TrayCommand::SyncNow => {
-                            info!("Tray: manual sync requested");
-                            self.do_sync_with_tray_update(sync_state, &handle).await;
+                            if tray_state.paused {
+                                debug!("Tray: manual sync requested while paused; ignoring");
+                            } else {
+                                info!("Tray: manual sync requested");
+                                self.do_sync_with_optional_tray_update(sync_state, &mut tray_state, &mut tray_handle).await;
+                            }
                         }
                         TrayCommand::Pause => {
                             info!("Tray: pausing sync");
-                            paused = true;
-                            let _ = handle.update(|t: &mut GitSyncTray| {
-                                t.state.paused = true;
-                                t.bump_icon_generation();
-                            }).await;
+                            tray_state.paused = true;
+                            self.tray_apply_state(&mut tray_handle, &tray_state).await;
                         }
                         TrayCommand::Resume => {
                             info!("Tray: resuming sync");
-                            paused = false;
-                            let _ = handle.update(|t: &mut GitSyncTray| {
-                                t.state.paused = false;
-                                t.bump_icon_generation();
-                            }).await;
+                            tray_state.paused = false;
+                            self.tray_apply_state(&mut tray_handle, &tray_state).await;
                         }
                         TrayCommand::Quit => {
                             info!("Tray: quit requested");
+                            if let Some(handle) = &tray_handle {
+                                // Best-effort shutdown; ignoring awaiter result.
+                                let _ = handle.shutdown();
+                            }
                             return Ok(());
+                        }
+                    }
+                }
+                dbus_event = async {
+                    if let Some((_, rx)) = dbus_bus_watch.as_mut() {
+                        rx.recv().await
+                    } else {
+                        None
+                    }
+                }, if dbus_bus_watch.is_some() => {
+                    match dbus_event {
+                        Some(()) => {
+                            info!("Detected D-Bus session bus socket activity; retrying tray startup now");
+                            tray_next_attempt = time::Instant::now();
+
+                            if tray_handle.is_none() && tray_spawn_task.is_none() {
+                                tray_spawn_task = Some(Self::spawn_tray_task(
+                                    tray_state.clone(),
+                                    cmd_tx.clone(),
+                                    tray_icon.clone(),
+                                ));
+                            }
+                        }
+                        None => {
+                            warn!("D-Bus session bus watcher channel closed; falling back to periodic retry");
+                            dbus_bus_watch = None;
                         }
                     }
                 }
@@ -355,12 +432,153 @@ impl WatchManager {
         }
     }
 
-    /// Handle timeout with tray state updates
     #[cfg(feature = "tray")]
-    async fn handle_timeout_with_tray(
+    fn spawn_tray_task(
+        tray_state: TrayState,
+        cmd_tx: tokio::sync::mpsc::UnboundedSender<TrayCommand>,
+        tray_icon: Option<String>,
+    ) -> tokio::task::JoinHandle<std::result::Result<ksni::Handle<GitSyncTray>, ksni::Error>> {
+        tokio::spawn(async move {
+            let tray = GitSyncTray::new(tray_state, cmd_tx, tray_icon);
+            // Treat missing watcher/host as a soft error and keep the service alive.
+            tray.assume_sni_available(true).spawn().await
+        })
+    }
+
+    #[cfg(feature = "tray")]
+    fn setup_dbus_session_bus_watch(
+    ) -> Option<(RecommendedWatcher, tokio::sync::mpsc::UnboundedReceiver<()>)> {
+        let Some(socket_path) = Self::dbus_session_bus_socket_path() else {
+            debug!("DBUS_SESSION_BUS_ADDRESS not watchable (no unix:path=...); using periodic tray retry");
+            return None;
+        };
+        Self::setup_dbus_socket_watch(socket_path)
+    }
+
+    #[cfg(feature = "tray")]
+    fn setup_dbus_socket_watch(
+        socket_path: PathBuf,
+    ) -> Option<(RecommendedWatcher, tokio::sync::mpsc::UnboundedReceiver<()>)> {
+        let Some(parent_dir) = socket_path.parent() else {
+            warn!(
+                path = %socket_path.display(),
+                "Unable to watch D-Bus session bus socket parent directory; using periodic tray retry"
+            );
+            return None;
+        };
+
+        let watched_name = socket_path.file_name().map(|n| n.to_os_string());
+        let socket_path_for_cb = socket_path.clone();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut watcher = match RecommendedWatcher::new(
+            move |res: std::result::Result<Event, notify::Error>| match res {
+                Ok(event) => {
+                    let matches_path = event.paths.iter().any(|path| {
+                        if *path == socket_path_for_cb {
+                            return true;
+                        }
+                        match (&watched_name, path.file_name()) {
+                            (Some(name), Some(file_name)) => file_name == name,
+                            _ => false,
+                        }
+                    });
+                    if matches_path {
+                        let _ = tx.send(());
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "D-Bus session bus watcher error");
+                }
+            },
+            Config::default(),
+        ) {
+            Ok(w) => w,
+            Err(e) => {
+                warn!(
+                    path = %socket_path.display(),
+                    error = %e,
+                    "Failed to create D-Bus session bus watcher; using periodic tray retry"
+                );
+                return None;
+            }
+        };
+
+        if let Err(e) = watcher.watch(parent_dir, RecursiveMode::NonRecursive) {
+            warn!(
+                path = %parent_dir.display(),
+                error = %e,
+                "Failed to watch D-Bus session bus directory; using periodic tray retry"
+            );
+            return None;
+        }
+
+        info!(
+            path = %socket_path.display(),
+            "Watching D-Bus session bus socket for tray reconnection triggers"
+        );
+        Some((watcher, rx))
+    }
+
+    #[cfg(feature = "tray")]
+    fn dbus_session_bus_socket_path() -> Option<PathBuf> {
+        let address = std::env::var("DBUS_SESSION_BUS_ADDRESS").ok()?;
+        Self::parse_dbus_unix_path(&address)
+    }
+
+    #[cfg(feature = "tray")]
+    fn parse_dbus_unix_path(address: &str) -> Option<PathBuf> {
+        // Address list format: "transport:key=value,...;transport:key=value,..."
+        for segment in address.split(';') {
+            if !segment.starts_with("unix:") {
+                continue;
+            }
+
+            let params = &segment["unix:".len()..];
+            for param in params.split(',') {
+                let Some((key, value)) = param.split_once('=') else {
+                    continue;
+                };
+                if key == "path" && !value.is_empty() {
+                    return Some(PathBuf::from(value));
+                }
+            }
+        }
+
+        None
+    }
+
+    #[cfg(feature = "tray")]
+    async fn tray_apply_state(
+        &self,
+        tray_handle: &mut Option<ksni::Handle<GitSyncTray>>,
+        tray_state: &TrayState,
+    ) {
+        let Some(handle) = tray_handle.as_ref() else {
+            return;
+        };
+
+        let state = tray_state.clone();
+        let update_result = handle
+            .update(move |t: &mut GitSyncTray| {
+                t.state = state;
+                t.bump_icon_generation();
+            })
+            .await;
+
+        if update_result.is_none() {
+            warn!("Tray: handle.update returned None - tray service may be dead; will attempt to respawn");
+            *tray_handle = None;
+        }
+    }
+
+    /// Handle timeout with optional tray state updates
+    #[cfg(feature = "tray")]
+    async fn handle_timeout_with_optional_tray(
         &self,
         sync_state: &mut SyncState,
-        handle: &ksni::Handle<GitSyncTray>,
+        tray_state: &mut TrayState,
+        tray_handle: &mut Option<ksni::Handle<GitSyncTray>>,
     ) {
         if !sync_state.should_sync() {
             return;
@@ -371,26 +589,21 @@ impl WatchManager {
             return;
         }
 
-        self.do_sync_with_tray_update(sync_state, handle).await;
+        self.do_sync_with_optional_tray_update(sync_state, tray_state, tray_handle)
+            .await;
     }
 
-    /// Perform sync and update tray state accordingly
+    /// Perform sync and update tray state accordingly (if available)
     #[cfg(feature = "tray")]
-    async fn do_sync_with_tray_update(
+    async fn do_sync_with_optional_tray_update(
         &self,
         sync_state: &mut SyncState,
-        handle: &ksni::Handle<GitSyncTray>,
+        tray_state: &mut TrayState,
+        tray_handle: &mut Option<ksni::Handle<GitSyncTray>>,
     ) {
         info!("Tray: setting status to Syncing");
-        let update_result = handle
-            .update(|t: &mut GitSyncTray| {
-                t.state.status = TrayStatus::Syncing;
-                t.bump_icon_generation();
-            })
-            .await;
-        if update_result.is_none() {
-            warn!("Tray: handle.update (Syncing) returned None - tray service may be dead");
-        }
+        tray_state.status = TrayStatus::Syncing;
+        self.tray_apply_state(tray_handle, tray_state).await;
 
         let span = tracing::info_span!(
             "perform_sync_attempt",
@@ -405,33 +618,18 @@ impl WatchManager {
             Ok(()) => {
                 info!("Tray: perform_sync succeeded, setting status to Idle");
                 sync_state.record_sync();
-                let now = std::time::Instant::now();
-                let update_result = handle
-                    .update(move |t: &mut GitSyncTray| {
-                        t.state.status = TrayStatus::Idle;
-                        t.state.last_sync = Some(now);
-                        t.state.last_error = None;
-                        t.bump_icon_generation();
-                    })
-                    .await;
-                if update_result.is_none() {
-                    warn!("Tray: handle.update (Idle) returned None - tray service may be dead");
-                }
+                tray_state.status = TrayStatus::Idle;
+                tray_state.last_sync = Some(std::time::Instant::now());
+                tray_state.last_error = None;
+                self.tray_apply_state(tray_handle, tray_state).await;
             }
             Err(e) => {
                 let err_msg = e.to_string();
                 self.log_sync_error(&e);
                 info!("Tray: perform_sync failed, setting status to Error");
-                let update_result = handle
-                    .update(move |t: &mut GitSyncTray| {
-                        t.state.status = TrayStatus::Error(err_msg.clone());
-                        t.state.last_error = Some(err_msg);
-                        t.bump_icon_generation();
-                    })
-                    .await;
-                if update_result.is_none() {
-                    warn!("Tray: handle.update (Error) returned None - tray service may be dead");
-                }
+                tray_state.status = TrayStatus::Error(err_msg.clone());
+                tray_state.last_error = Some(err_msg);
+                self.tray_apply_state(tray_handle, tray_state).await;
             }
         }
     }
@@ -681,5 +879,51 @@ pub async fn watch_with_periodic_sync(
     } else {
         // Just run watch mode
         manager.watch().await
+    }
+}
+
+#[cfg(all(test, feature = "tray"))]
+mod tests {
+    use super::WatchManager;
+    use std::fs::File;
+    use tempfile::tempdir;
+    use tokio::time::{timeout, Duration};
+
+    #[test]
+    fn parse_dbus_unix_path_finds_path_with_extra_parameters() {
+        let address =
+            "unix:abstract=/tmp/dbus-XXXX,guid=abcdef;unix:path=/tmp/dbus-test-socket,guid=1234";
+        let parsed = WatchManager::parse_dbus_unix_path(address);
+        assert_eq!(
+            parsed.as_deref(),
+            Some(std::path::Path::new("/tmp/dbus-test-socket"))
+        );
+    }
+
+    #[test]
+    fn parse_dbus_unix_path_ignores_malformed_parts() {
+        let address = "unix:guid=abc,broken,other=123,another;unix:path=/tmp/dbus-test";
+        let parsed = WatchManager::parse_dbus_unix_path(address);
+        assert_eq!(
+            parsed.as_deref(),
+            Some(std::path::Path::new("/tmp/dbus-test"))
+        );
+    }
+
+    #[tokio::test]
+    async fn setup_dbus_socket_watch_emits_on_socket_file_activity() {
+        let dir = tempdir().expect("create tempdir");
+        let socket_path = dir.path().join("bus");
+
+        let (_watcher, mut rx) = WatchManager::setup_dbus_socket_watch(socket_path.clone())
+            .expect("watcher should initialize for valid path");
+
+        // Creating the bus socket path (or regular file in tests) should trigger a retry signal.
+        File::create(&socket_path).expect("create watched file");
+
+        let received = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timed out waiting for watcher event");
+        assert_eq!(received, Some(()));
     }
 }
