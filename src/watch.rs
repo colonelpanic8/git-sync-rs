@@ -338,6 +338,7 @@ impl WatchManager {
         > = None;
         let mut dbus_bus_watch = Self::setup_dbus_session_bus_watch();
         let mut sync_state_change_rx = self.sync_state_change_tx.subscribe();
+        let mut last_sync_text_snapshot = tray_state.last_sync_text();
 
         loop {
             tokio::select! {
@@ -395,6 +396,12 @@ impl WatchManager {
                     }
                     self.reconcile_tray_state_from_global(&mut tray_state, &mut tray_handle)
                         .await;
+                    self.refresh_tray_relative_time_display(
+                        &mut tray_state,
+                        &mut tray_handle,
+                        &mut last_sync_text_snapshot,
+                    )
+                    .await;
                 }
                 Some(event) = rx.recv() => {
                     if !tray_state.paused {
@@ -462,6 +469,12 @@ impl WatchManager {
                         Ok(()) => {
                             self.reconcile_tray_state_from_global(&mut tray_state, &mut tray_handle)
                                 .await;
+                            self.refresh_tray_relative_time_display(
+                                &mut tray_state,
+                                &mut tray_handle,
+                                &mut last_sync_text_snapshot,
+                            )
+                            .await;
                         }
                         Err(e) => {
                             warn!(error = %e, "Tray sync-state update channel closed");
@@ -646,6 +659,24 @@ impl WatchManager {
         if changed {
             self.tray_apply_state(tray_handle, tray_state).await;
         }
+    }
+
+    #[cfg(feature = "tray")]
+    async fn refresh_tray_relative_time_display(
+        &self,
+        tray_state: &mut TrayState,
+        tray_handle: &mut Option<ksni::Handle<GitSyncTray>>,
+        last_sync_text_snapshot: &mut String,
+    ) {
+        let current = tray_state.last_sync_text();
+        if &current == last_sync_text_snapshot {
+            return;
+        }
+
+        *last_sync_text_snapshot = current;
+        // State payload is unchanged, but tooltip/menu text derived from `Local::now()`
+        // advanced. Emitting an update keeps the displayed relative age fresh.
+        self.tray_apply_state(tray_handle, tray_state).await;
     }
 
     #[cfg(feature = "tray")]
