@@ -22,6 +22,8 @@ use tracing::{debug, error, info, warn};
 
 #[cfg(feature = "tray")]
 const TRAY_RETRY_FALLBACK_DELAY: Duration = Duration::from_secs(15);
+#[cfg(feature = "tray")]
+const TRAY_RETRY_SOON_DELAY: Duration = Duration::from_secs(1);
 
 /// Watch mode configuration
 #[derive(Debug, Clone)]
@@ -360,12 +362,21 @@ impl WatchManager {
                                     .await;
                                 }
                                 Ok(Err(e)) => {
+                                    let retry_delay = match &e {
+                                        ksni::Error::WontShow => TRAY_RETRY_SOON_DELAY,
+                                        ksni::Error::Watcher(fdo_err)
+                                            if format!("{fdo_err:?}").contains("UnknownObject") =>
+                                        {
+                                            TRAY_RETRY_SOON_DELAY
+                                        }
+                                        _ => TRAY_RETRY_FALLBACK_DELAY,
+                                    };
                                     warn!(
                                         error = %e,
-                                        delay_s = TRAY_RETRY_FALLBACK_DELAY.as_secs_f64(),
+                                        delay_s = retry_delay.as_secs_f64(),
                                         "Tray unavailable; will retry"
                                     );
-                                    tray_next_attempt = time::Instant::now() + TRAY_RETRY_FALLBACK_DELAY;
+                                    tray_next_attempt = time::Instant::now() + retry_delay;
                                 }
                                 Err(e) => {
                                     warn!(
@@ -436,6 +447,20 @@ impl WatchManager {
                             }
                             return Ok(());
                         }
+                        TrayCommand::Respawn { reason } => {
+                            warn!(reason = %reason, "Tray: respawn requested");
+
+                            if let Some(task) = tray_spawn_task.take() {
+                                task.abort();
+                            }
+
+                            if let Some(handle) = tray_handle.take() {
+                                // Best-effort shutdown; if the service already stopped this is a no-op.
+                                handle.shutdown().await;
+                            }
+
+                            tray_next_attempt = time::Instant::now() + TRAY_RETRY_SOON_DELAY;
+                        }
                     }
                 }
                 dbus_event = async {
@@ -493,7 +518,9 @@ impl WatchManager {
     ) -> tokio::task::JoinHandle<std::result::Result<ksni::Handle<GitSyncTray>, ksni::Error>> {
         tokio::spawn(async move {
             let tray = GitSyncTray::new(tray_state, cmd_tx, tray_icon);
-            // Treat missing watcher/host as a soft error and keep the service alive.
+            // Keep the service alive even if the watcher/host isn't ready yet.
+            // We handle reconnection by listening for watcher state changes and, on
+            // certain errors, respawning the tray service from the outer loop.
             tray.assume_sni_available(true).spawn().await
         })
     }

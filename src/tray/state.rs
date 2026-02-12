@@ -23,6 +23,14 @@ pub enum TrayCommand {
     Pause,
     Resume,
     Quit,
+    /// Internal command: request the tray service be restarted.
+    ///
+    /// Used to recover from transient SNI watcher restart races where ksni's
+    /// re-register attempt fails (e.g. `UnknownObject`) and no further
+    /// `NameOwnerChanged` events will be emitted to trigger another retry.
+    Respawn {
+        reason: String,
+    },
 }
 
 impl TrayState {

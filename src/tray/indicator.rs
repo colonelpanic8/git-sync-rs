@@ -314,6 +314,37 @@ impl ksni::Tray for GitSyncTray {
 
     fn watcher_offline(&self, reason: ksni::OfflineReason) -> bool {
         warn!(reason = ?reason, "Tray: StatusNotifierWatcher is offline; tray may not be visible yet");
+        // Keep running if the watcher is simply absent. In that case ksni will
+        // wait for `NameOwnerChanged` and (re)register when the watcher appears.
+        if let ksni::OfflineReason::Error(ksni::Error::Watcher(fdo_err)) = &reason {
+            let fdo_dbg = format!("{fdo_err:?}");
+            if fdo_dbg.contains("ServiceUnknown") {
+                return true;
+            }
+
+            // If we encountered `UnknownObject` while (re)registering with the watcher,
+            // restart the tray service. This recovers from watcher-restart races where the
+            // bus name exists but `/StatusNotifierWatcher` is not exported yet and no
+            // further `NameOwnerChanged` will be emitted to trigger another retry.
+            if fdo_dbg.contains("UnknownObject") {
+                let _ = self.cmd_tx.send(TrayCommand::Respawn {
+                    reason: format!("{reason:?}"),
+                });
+                return false;
+            }
+
+            return true;
+        }
+
+        // For D-Bus errors, restart the tray service so the outer loop can attempt
+        // a fresh connection.
+        if matches!(reason, ksni::OfflineReason::Error(ksni::Error::Dbus(_))) {
+            let _ = self.cmd_tx.send(TrayCommand::Respawn {
+                reason: format!("{reason:?}"),
+            });
+            return false;
+        }
+
         true
     }
 }
