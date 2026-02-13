@@ -26,7 +26,13 @@ struct Cli {
     quiet: bool,
 
     /// Sync new/untracked files (compatible with original git-sync -n flag)
-    #[arg(short = 'n', long, global = true)]
+    #[arg(
+        short = 'n',
+        long,
+        global = true,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
     new_files: Option<bool>,
 
     /// Dry run mode - detect changes but don't sync (for default watch mode)
