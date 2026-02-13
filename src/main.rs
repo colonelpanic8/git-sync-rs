@@ -9,9 +9,16 @@ use std::path::Path;
 use std::process;
 use tracing::{error, info};
 
+const CLI_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (git commit ",
+    env!("GIT_COMMIT_HASH"),
+    ")"
+);
+
 #[derive(Parser)]
 #[command(name = "git-sync-rs")]
-#[command(version, about = "Automatically sync git repositories", long_about = None)]
+#[command(version = CLI_VERSION, about = "Automatically sync git repositories", long_about = None)]
 struct Cli {
     /// Repository path to sync (defaults to current directory)
     #[arg(value_name = "PATH")]
@@ -297,9 +304,7 @@ async fn run(cli: Cli) -> Result<()> {
 }
 
 fn print_version() -> Result<()> {
-    let version = env!("CARGO_PKG_VERSION");
-    let commit = option_env!("GIT_COMMIT_HASH").unwrap_or("unknown");
-    println!("git-sync-rs {version} (git commit {commit})");
+    println!("git-sync-rs {CLI_VERSION}");
     Ok(())
 }
 
