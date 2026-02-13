@@ -289,7 +289,7 @@ async fn run(cli: Cli) -> Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!(e))
         }
-    Some(Commands::Init { .. }) => {
+        Some(Commands::Init { .. }) => {
             // Already handled above
             unreachable!()
         }

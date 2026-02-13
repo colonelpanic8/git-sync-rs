@@ -17,9 +17,7 @@ fn get_git_commit() -> Result<String, String> {
         return Err(String::from_utf8_lossy(&output.stderr).to_string());
     }
 
-    let commit = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .to_string();
+    let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
     if commit.is_empty() {
         return Err("empty git commit hash".into());
