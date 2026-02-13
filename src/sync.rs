@@ -1,8 +1,14 @@
+mod transport;
+
 use crate::error::{Result, SyncError};
 use chrono::Local;
 use git2::{BranchType, MergeOptions, Oid, Repository, Status, StatusOptions};
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tracing::{debug, error, info, warn};
+
+pub use transport::{CommandGitTransport, CommitOutcome, GitTransport};
 
 /// Prefix for fallback branches created by git-sync
 pub const FALLBACK_BRANCH_PREFIX: &str = "git-sync/";
@@ -71,6 +77,9 @@ pub enum RepositoryState {
     /// Repository is applying patches (git am)
     ApplyingPatches,
 
+    /// Repository is in the middle of a revert
+    Reverting,
+
     /// HEAD is detached
     DetachedHead,
 }
@@ -115,11 +124,21 @@ pub struct RepositorySynchronizer {
     config: SyncConfig,
     _repo_path: PathBuf,
     fallback_state: FallbackState,
+    transport: Arc<dyn GitTransport>,
 }
 
 impl RepositorySynchronizer {
     /// Create a new synchronizer for the given repository path
     pub fn new(repo_path: impl AsRef<Path>, config: SyncConfig) -> Result<Self> {
+        Self::new_with_transport(repo_path, config, Arc::new(CommandGitTransport))
+    }
+
+    /// Create a new synchronizer with explicit git transport implementation
+    pub fn new_with_transport(
+        repo_path: impl AsRef<Path>,
+        config: SyncConfig,
+        transport: Arc<dyn GitTransport>,
+    ) -> Result<Self> {
         let repo_path = repo_path.as_ref().to_path_buf();
         let repo = Repository::open(&repo_path).map_err(|_| SyncError::NotARepository {
             path: repo_path.display().to_string(),
@@ -130,13 +149,27 @@ impl RepositorySynchronizer {
             config,
             _repo_path: repo_path,
             fallback_state: FallbackState::default(),
+            transport,
         })
     }
 
     /// Create a new synchronizer with auto-detected branch name
     pub fn new_with_detected_branch(
         repo_path: impl AsRef<Path>,
+        config: SyncConfig,
+    ) -> Result<Self> {
+        Self::new_with_detected_branch_and_transport(
+            repo_path,
+            config,
+            Arc::new(CommandGitTransport),
+        )
+    }
+
+    /// Create a new synchronizer with auto-detected branch and explicit git transport
+    pub fn new_with_detected_branch_and_transport(
+        repo_path: impl AsRef<Path>,
         mut config: SyncConfig,
+        transport: Arc<dyn GitTransport>,
     ) -> Result<Self> {
         let repo_path = repo_path.as_ref().to_path_buf();
         let repo = Repository::open(&repo_path).map_err(|_| SyncError::NotARepository {
@@ -157,14 +190,19 @@ impl RepositorySynchronizer {
             config,
             _repo_path: repo_path,
             fallback_state: FallbackState::default(),
+            transport,
         })
     }
 
     /// Get the current repository state
     pub fn get_repository_state(&self) -> Result<RepositoryState> {
         // Check if HEAD is detached
-        if self.repo.head_detached()? {
-            return Ok(RepositoryState::DetachedHead);
+        match self.repo.head_detached() {
+            Ok(true) => return Ok(RepositoryState::DetachedHead),
+            Ok(false) => {}
+            // Unborn branches are valid in bootstrap flows.
+            Err(e) if e.code() == git2::ErrorCode::UnbornBranch => {}
+            Err(e) => return Err(e.into()),
         }
 
         // Check for various in-progress operations
@@ -189,11 +227,13 @@ impl RepositorySynchronizer {
             git2::RepositoryState::CherryPick | git2::RepositoryState::CherryPickSequence => {
                 Ok(RepositoryState::CherryPicking)
             }
+            git2::RepositoryState::Revert | git2::RepositoryState::RevertSequence => {
+                Ok(RepositoryState::Reverting)
+            }
             git2::RepositoryState::Bisect => Ok(RepositoryState::Bisecting),
             git2::RepositoryState::ApplyMailbox | git2::RepositoryState::ApplyMailboxOrRebase => {
                 Ok(RepositoryState::ApplyingPatches)
             }
-            _ => Ok(RepositoryState::Clean),
         }
     }
 
@@ -206,26 +246,24 @@ impl RepositorySynchronizer {
 
         for entry in statuses.iter() {
             let status = entry.status();
+            let tracked_or_staged_changes = Status::WT_MODIFIED
+                | Status::WT_DELETED
+                | Status::WT_RENAMED
+                | Status::WT_TYPECHANGE
+                | Status::INDEX_MODIFIED
+                | Status::INDEX_DELETED
+                | Status::INDEX_RENAMED
+                | Status::INDEX_TYPECHANGE
+                | Status::INDEX_NEW;
 
             if self.config.sync_new_files {
                 // Check for any changes including new files
-                if status.intersects(
-                    Status::WT_MODIFIED
-                        | Status::WT_DELETED
-                        | Status::WT_RENAMED
-                        | Status::WT_TYPECHANGE
-                        | Status::WT_NEW,
-                ) {
+                if status.intersects(tracked_or_staged_changes | Status::WT_NEW) {
                     return Ok(true);
                 }
             } else {
                 // Only check for modifications to tracked files
-                if status.intersects(
-                    Status::WT_MODIFIED
-                        | Status::WT_DELETED
-                        | Status::WT_RENAMED
-                        | Status::WT_TYPECHANGE,
-                ) {
+                if status.intersects(tracked_or_staged_changes) {
                     return Ok(true);
                 }
             }
@@ -256,7 +294,21 @@ impl RepositorySynchronizer {
 
     /// Get the current branch name
     pub fn get_current_branch(&self) -> Result<String> {
-        let head = self.repo.head()?;
+        let head = match self.repo.head() {
+            Ok(head) => head,
+            Err(e) if e.code() == git2::ErrorCode::UnbornBranch => {
+                if let Some(branch) = self.unborn_head_branch_name()? {
+                    return Ok(branch);
+                }
+                if !self.config.branch_name.is_empty() {
+                    return Ok(self.config.branch_name.clone());
+                }
+                return Err(SyncError::Other(
+                    "Repository HEAD is unborn and branch name could not be determined".to_string(),
+                ));
+            }
+            Err(e) => return Err(e.into()),
+        };
 
         if !head.is_branch() {
             return Err(SyncError::DetachedHead);
@@ -327,16 +379,6 @@ impl RepositorySynchronizer {
 
         index.write()?;
 
-        // Check if there's anything to commit
-        let tree_id = index.write_tree()?;
-        let tree = self.repo.find_tree(tree_id)?;
-
-        let parent_commit = self.repo.head()?.peel_to_commit()?;
-        if parent_commit.tree_id() == tree_id {
-            debug!("No changes to commit");
-            return Ok(());
-        }
-
         // Prepare commit message
         let message = if let Some(ref msg) = self.config.commit_message {
             msg.replace("{hostname}", &hostname::get()?.to_string_lossy())
@@ -352,14 +394,16 @@ impl RepositorySynchronizer {
             )
         };
 
-        // Create signature
-        let sig = self.repo.signature()?;
+        match self
+            .transport
+            .commit(&self._repo_path, &message, self.config.skip_hooks)?
+        {
+            CommitOutcome::Created => info!("Created auto-commit: {}", message),
+            CommitOutcome::NoChanges => {
+                debug!("No changes to commit");
+            }
+        }
 
-        // Create commit
-        self.repo
-            .commit(Some("HEAD"), &sig, &sig, &message, &tree, &[&parent_commit])?;
-
-        info!("Created auto-commit: {}", message);
         Ok(())
     }
 
@@ -370,20 +414,12 @@ impl RepositorySynchronizer {
             branch, self.config.remote_name
         );
 
-        use std::process::Command;
-
-        let output = Command::new("git")
-            .arg("fetch")
-            .arg(&self.config.remote_name)
-            .arg(branch)
-            .current_dir(&self._repo_path)
-            .output()
-            .map_err(|e| SyncError::Other(format!("Failed to run git fetch: {}", e)))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            error!("Git fetch failed: {}", stderr);
-            return Err(SyncError::Other(format!("Git fetch failed: {}", stderr)));
+        if let Err(e) =
+            self.transport
+                .fetch_branch(&self._repo_path, &self.config.remote_name, branch)
+        {
+            error!("Git fetch failed: {}", e);
+            return Err(e);
         }
 
         info!(
@@ -395,266 +431,36 @@ impl RepositorySynchronizer {
 
     /// Fetch from remote
     pub fn fetch(&self) -> Result<()> {
-        self.fetch_branch(&self.config.branch_name)?;
+        let current_branch = self.get_current_branch()?;
+        self.fetch_branch(&current_branch)?;
 
         // If we're on a fallback branch and have a target branch, also fetch that
         if self.config.conflict_branch {
             if let Ok(target) = self.get_target_branch() {
-                if target != self.config.branch_name {
+                if target != current_branch {
                     // Ignore errors fetching target - it might not be necessary
                     let _ = self.fetch_branch(&target);
                 }
             }
         }
 
-        return Ok(());
-
-        // Original libgit2 implementation (keeping for reference)
-        #[allow(unreachable_code)]
-        {
-            let mut remote = self.repo.find_remote(&self.config.remote_name)?;
-
-            // Log the remote URL for debugging
-            if let Some(url) = remote.url() {
-                debug!("Remote URL: {}", url);
-            }
-
-            // Prepare callbacks for authentication
-            let mut callbacks = git2::RemoteCallbacks::new();
-            callbacks.credentials(|url, username_from_url, allowed_types| {
-                debug!(
-                    "Authentication callback: url={}, username={:?}, allowed_types={:?}",
-                    url, username_from_url, allowed_types
-                );
-
-                let username = username_from_url.unwrap_or("git");
-
-                // First try SSH agent
-                debug!("Trying SSH key from agent with username: {}", username);
-                match git2::Cred::ssh_key_from_agent(username) {
-                    Ok(cred) => {
-                        debug!("Successfully obtained SSH credentials from agent");
-                        return Ok(cred);
-                    }
-                    Err(e) => {
-                        debug!("SSH agent failed: {}, trying default SSH key", e);
-                    }
-                }
-
-                // Fallback to default SSH key
-                let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-                let ssh_dir = std::path::Path::new(&home).join(".ssh");
-                let private_key = ssh_dir.join("id_rsa");
-                let public_key = ssh_dir.join("id_rsa.pub");
-
-                // Try id_rsa first
-                if private_key.exists() {
-                    debug!("Trying SSH key from {:?}", private_key);
-                    match git2::Cred::ssh_key(username, Some(&public_key), &private_key, None) {
-                        Ok(cred) => {
-                            debug!("Successfully using SSH key from disk");
-                            return Ok(cred);
-                        }
-                        Err(e) => {
-                            debug!("Failed to use id_rsa: {}", e);
-                        }
-                    }
-                }
-
-                // Try id_ed25519
-                let private_key = ssh_dir.join("id_ed25519");
-                let public_key = ssh_dir.join("id_ed25519.pub");
-                if private_key.exists() {
-                    debug!("Trying SSH key from {:?}", private_key);
-                    match git2::Cred::ssh_key(username, Some(&public_key), &private_key, None) {
-                        Ok(cred) => {
-                            debug!("Successfully using ed25519 SSH key from disk");
-                            return Ok(cred);
-                        }
-                        Err(e) => {
-                            debug!("Failed to use id_ed25519: {}", e);
-                        }
-                    }
-                }
-
-                error!("No working SSH authentication method found");
-                Err(git2::Error::from_str(
-                    "No SSH authentication method available",
-                ))
-            });
-
-            // Add progress callback
-            callbacks.transfer_progress(|stats| {
-                debug!(
-                    "Fetch progress: {}/{} objects, {} bytes received",
-                    stats.received_objects(),
-                    stats.total_objects(),
-                    stats.received_bytes()
-                );
-                true
-            });
-
-            let mut fetch_options = git2::FetchOptions::new();
-            fetch_options.remote_callbacks(callbacks);
-
-            // Try to set proxy options from git config
-            let mut proxy_options = git2::ProxyOptions::new();
-            proxy_options.auto();
-            fetch_options.proxy_options(proxy_options);
-
-            debug!("Starting fetch for branch: {}", self.config.branch_name);
-            debug!(
-                "Fetching refspec: refs/heads/{}:refs/remotes/{}/{}",
-                self.config.branch_name, self.config.remote_name, self.config.branch_name
-            );
-
-            // Fetch the branch
-            match remote.fetch(&[&self.config.branch_name], Some(&mut fetch_options), None) {
-                Ok(_) => {
-                    info!(
-                        "Fetch completed successfully from remote: {}",
-                        self.config.remote_name
-                    );
-                    Ok(())
-                }
-                Err(e) => {
-                    error!(
-                        "Fetch failed from remote {}: {}",
-                        self.config.remote_name, e
-                    );
-                    Err(e.into())
-                }
-            }
-        }
+        Ok(())
     }
 
     /// Push to remote
     pub fn push(&self) -> Result<()> {
         info!("Pushing to remote: {}", self.config.remote_name);
 
-        // Use git command directly as a workaround for SSH issues
-        use std::process::Command;
-
-        let refspec = format!("{}:{}", self.config.branch_name, self.config.branch_name);
-
-        let output = Command::new("git")
-            .arg("push")
-            .arg(&self.config.remote_name)
-            .arg(&refspec)
-            .current_dir(&self._repo_path)
-            .output()
-            .map_err(|e| SyncError::Other(format!("Failed to run git push: {}", e)))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            error!("Git push failed: {}", stderr);
-            return Err(SyncError::Other(format!("Git push failed: {}", stderr)));
-        }
+        let current_branch = self.get_current_branch()?;
+        let refspec = format!("{}:{}", current_branch, current_branch);
+        self.transport
+            .push_refspec(&self._repo_path, &self.config.remote_name, &refspec)?;
 
         info!(
             "Push completed successfully to remote: {}",
             self.config.remote_name
         );
-        return Ok(());
-
-        // Original libgit2 implementation (keeping for reference)
-        #[allow(unreachable_code)]
-        {
-            let mut remote = self.repo.find_remote(&self.config.remote_name)?;
-
-            // Prepare callbacks for authentication
-            let mut callbacks = git2::RemoteCallbacks::new();
-            callbacks.credentials(|url, username_from_url, allowed_types| {
-                debug!(
-                    "Authentication callback: url={}, username={:?}, allowed_types={:?}",
-                    url, username_from_url, allowed_types
-                );
-
-                let username = username_from_url.unwrap_or("git");
-
-                // First try SSH agent
-                debug!("Trying SSH key from agent with username: {}", username);
-                match git2::Cred::ssh_key_from_agent(username) {
-                    Ok(cred) => {
-                        debug!("Successfully obtained SSH credentials from agent");
-                        return Ok(cred);
-                    }
-                    Err(e) => {
-                        debug!("SSH agent failed: {}, trying default SSH key", e);
-                    }
-                }
-
-                // Fallback to default SSH key
-                let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-                let ssh_dir = std::path::Path::new(&home).join(".ssh");
-                let private_key = ssh_dir.join("id_rsa");
-                let public_key = ssh_dir.join("id_rsa.pub");
-
-                // Try id_rsa first
-                if private_key.exists() {
-                    debug!("Trying SSH key from {:?}", private_key);
-                    match git2::Cred::ssh_key(username, Some(&public_key), &private_key, None) {
-                        Ok(cred) => {
-                            debug!("Successfully using SSH key from disk");
-                            return Ok(cred);
-                        }
-                        Err(e) => {
-                            debug!("Failed to use id_rsa: {}", e);
-                        }
-                    }
-                }
-
-                // Try id_ed25519
-                let private_key = ssh_dir.join("id_ed25519");
-                let public_key = ssh_dir.join("id_ed25519.pub");
-                if private_key.exists() {
-                    debug!("Trying SSH key from {:?}", private_key);
-                    match git2::Cred::ssh_key(username, Some(&public_key), &private_key, None) {
-                        Ok(cred) => {
-                            debug!("Successfully using ed25519 SSH key from disk");
-                            return Ok(cred);
-                        }
-                        Err(e) => {
-                            debug!("Failed to use id_ed25519: {}", e);
-                        }
-                    }
-                }
-
-                error!("No working SSH authentication method found");
-                Err(git2::Error::from_str(
-                    "No SSH authentication method available",
-                ))
-            });
-
-            let mut push_options = git2::PushOptions::new();
-            push_options.remote_callbacks(callbacks);
-
-            // Try to set proxy options from git config
-            let mut proxy_options = git2::ProxyOptions::new();
-            proxy_options.auto();
-            push_options.proxy_options(proxy_options);
-
-            // Push the branch
-            let refspec = format!(
-                "refs/heads/{}:refs/heads/{}",
-                self.config.branch_name, self.config.branch_name
-            );
-
-            debug!("Pushing refspec: {}", refspec);
-            match remote.push(&[&refspec], Some(&mut push_options)) {
-                Ok(_) => {
-                    info!(
-                        "Push completed successfully to remote: {}",
-                        self.config.remote_name
-                    );
-                    Ok(())
-                }
-                Err(e) => {
-                    error!("Push failed to remote {}: {}", self.config.remote_name, e);
-                    Err(e.into())
-                }
-            }
-        }
+        Ok(())
     }
 
     /// Perform a fast-forward merge
@@ -854,22 +660,11 @@ impl RepositorySynchronizer {
     pub fn push_branch(&self, branch_name: &str) -> Result<()> {
         info!("Pushing branch {} to remote", branch_name);
 
-        use std::process::Command;
-
-        let output = Command::new("git")
-            .arg("push")
-            .arg("-u")
-            .arg(&self.config.remote_name)
-            .arg(branch_name)
-            .current_dir(&self._repo_path)
-            .output()
-            .map_err(|e| SyncError::Other(format!("Failed to run git push: {}", e)))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            error!("Git push failed: {}", stderr);
-            return Err(SyncError::Other(format!("Git push failed: {}", stderr)));
-        }
+        self.transport.push_branch_upstream(
+            &self._repo_path,
+            &self.config.remote_name,
+            branch_name,
+        )?;
 
         info!("Successfully pushed branch {} to remote", branch_name);
         Ok(())
@@ -1018,9 +813,6 @@ impl RepositorySynchronizer {
         checkout_builder.force();
         self.repo.checkout_head(Some(&mut checkout_builder))?;
 
-        // Update config to reflect we're on the target branch now
-        self.config.branch_name = target_branch.clone();
-
         if has_commits_to_rebase {
             info!(
                 "Rebasing {} commits from {} onto {}",
@@ -1058,7 +850,6 @@ impl RepositorySynchronizer {
                     // Switch back to fallback branch
                     self.repo.set_head(&fallback_ref)?;
                     self.repo.checkout_head(Some(&mut checkout_builder))?;
-                    self.config.branch_name = current_branch;
                     self.fallback_state.last_checked_target_oid = Some(target_oid);
                     return Ok(false);
                 }
@@ -1146,6 +937,20 @@ impl RepositorySynchronizer {
             return Ok(());
         }
 
+        // Bootstrap flow for freshly cloned empty repositories.
+        // In this state HEAD points to a branch name but has no commit yet.
+        if self.is_head_unborn()? {
+            info!("Repository HEAD is unborn; attempting initial publish");
+            if self.has_local_changes()? {
+                self.auto_commit()?;
+                let branch = self.get_current_branch()?;
+                self.push_branch(&branch)?;
+            } else {
+                info!("HEAD is unborn and there are no local changes to publish");
+            }
+            return Ok(());
+        }
+
         // Fetch from remote first (needed for both normal sync and return-to-target check)
         self.fetch()?;
 
@@ -1181,12 +986,6 @@ impl RepositorySynchronizer {
             SyncState::Diverged { .. } => {
                 info!("Branches have diverged, rebasing");
                 self.rebase()?;
-                // After successful rebase (or fallback branch creation), push the changes
-                // Note: if we switched to a fallback branch, we need to update our branch name
-                let current_branch = self.get_current_branch()?;
-                if current_branch != self.config.branch_name {
-                    self.config.branch_name = current_branch;
-                }
                 self.push()?;
             }
             SyncState::NoUpstream => {
@@ -1196,9 +995,10 @@ impl RepositorySynchronizer {
                     let branch = self.get_current_branch()?;
                     self.push_branch(&branch)?;
                 } else {
-                    return Err(SyncError::NoRemoteConfigured {
-                        branch: self.config.branch_name.clone(),
-                    });
+                    let branch = self
+                        .get_current_branch()
+                        .unwrap_or_else(|_| "<unknown>".into());
+                    return Err(SyncError::NoRemoteConfigured { branch });
                 }
             }
         }
@@ -1217,5 +1017,27 @@ impl RepositorySynchronizer {
 
         info!("Sync completed successfully");
         Ok(())
+    }
+
+    /// Returns true when HEAD points at an unborn branch (no commit yet).
+    fn is_head_unborn(&self) -> Result<bool> {
+        match self.repo.head() {
+            Ok(head) => match head.peel_to_commit() {
+                Ok(_) => Ok(false),
+                Err(e) if e.code() == git2::ErrorCode::UnbornBranch => Ok(true),
+                Err(e) => Err(e.into()),
+            },
+            Err(e) if e.code() == git2::ErrorCode::UnbornBranch => Ok(true),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn unborn_head_branch_name(&self) -> Result<Option<String>> {
+        let head_path = self.repo.path().join("HEAD");
+        let head_contents = fs::read_to_string(head_path)?;
+        Ok(head_contents
+            .trim()
+            .strip_prefix("ref: refs/heads/")
+            .map(|s| s.to_string()))
     }
 }
