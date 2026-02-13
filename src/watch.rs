@@ -1,11 +1,14 @@
+mod event_filter;
+
+use self::event_filter::EventFilter;
 use crate::error::{Result, SyncError};
 use crate::sync::{RepositorySynchronizer, SyncConfig};
 #[cfg(feature = "tray")]
 use crate::tray::{GitSyncTray, TrayCommand, TrayState, TrayStatus};
-use git2::Repository;
 #[cfg(feature = "tray")]
 use ksni::TrayMethods;
-use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
+use std::future::pending;
 use std::path::{Path, PathBuf};
 #[cfg(feature = "tray")]
 use std::sync::atomic::AtomicU64;
@@ -45,6 +48,10 @@ pub struct WatchConfig {
 
     /// Custom tray icon: a freedesktop icon name or a path to an image file
     pub tray_icon: Option<String>,
+
+    /// Optional periodic sync interval in milliseconds.
+    /// When set, sync attempts are triggered even without filesystem events.
+    pub periodic_sync_interval_ms: Option<u64>,
 }
 
 impl Default for WatchConfig {
@@ -56,6 +63,7 @@ impl Default for WatchConfig {
             dry_run: false,
             enable_tray: false,
             tray_icon: None,
+            periodic_sync_interval_ms: None,
         }
     }
 }
@@ -111,91 +119,7 @@ impl FileEventHandler {
     }
 
     fn should_process_event(&self, event: &Event) -> bool {
-        // Ignore git directory changes
-        if self.is_git_internal(event) {
-            debug!("Ignoring git internal event");
-            return false;
-        }
-
-        // Open repository for gitignore check
-        let repo = match Repository::open(&self.repo_path) {
-            Ok(r) => r,
-            Err(e) => {
-                error!("Failed to open repository for gitignore check: {}", e);
-                return false;
-            }
-        };
-
-        // Check if any path in the event should be ignored
-        let should_ignore = event
-            .paths
-            .iter()
-            .any(|path| self.should_ignore_path(&repo, path));
-
-        if should_ignore {
-            debug!("Ignoring gitignored file event");
-            return false;
-        }
-
-        // Check if this is a relevant change type
-        if !self.is_relevant_change(event) {
-            debug!("Event not considered relevant: {:?}", event.kind);
-            return false;
-        }
-
-        true
-    }
-
-    /// Check if an event is related to git internals
-    fn is_git_internal(&self, event: &Event) -> bool {
-        event
-            .paths
-            .iter()
-            .any(|path| path.components().any(|c| c.as_os_str() == ".git"))
-    }
-
-    /// Check if a path should be ignored according to gitignore rules
-    fn should_ignore_path(&self, repo: &Repository, file_path: &Path) -> bool {
-        // Make path relative to repo root
-        let relative_path = match file_path.strip_prefix(&self.repo_path) {
-            Ok(p) => p,
-            Err(_) => {
-                debug!("Path {:?} is outside repo, ignoring", file_path);
-                return true;
-            }
-        };
-
-        // Check if the path is ignored by git
-        match repo.status_should_ignore(relative_path) {
-            Ok(ignored) => {
-                if ignored {
-                    debug!("Path {:?} is gitignored", relative_path);
-                }
-                ignored
-            }
-            Err(e) => {
-                debug!(
-                    "Error checking gitignore status for {:?}: {}",
-                    relative_path, e
-                );
-                false
-            }
-        }
-    }
-
-    /// Check if an event represents a relevant change
-    fn is_relevant_change(&self, event: &Event) -> bool {
-        let is_relevant = matches!(
-            event.kind,
-            EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-        );
-
-        debug!(
-            "is_relevant_change: kind={:?}, relevant={}",
-            event.kind, is_relevant
-        );
-
-        is_relevant
+        EventFilter::should_process_event(&self.repo_path, event)
     }
 }
 
@@ -269,7 +193,7 @@ impl WatchManager {
 
     /// Process file system events
     async fn process_events(&self, mut rx: mpsc::Receiver<Event>) -> Result<()> {
-        let mut sync_state = SyncState::new(
+        let mut sync_state = SyncScheduler::new(
             self.watch_config.debounce_ms,
             self.watch_config.min_interval_ms,
         );
@@ -283,23 +207,49 @@ impl WatchManager {
         let mut interval = time::interval(Duration::from_millis(tick_ms));
         interval.tick().await; // align first tick
 
+        let mut periodic_interval =
+            self.watch_config
+                .periodic_sync_interval_ms
+                .map(|interval_ms| {
+                    info!(
+                        "Periodic sync enabled (interval: {}s)",
+                        interval_ms as f64 / 1000.0
+                    );
+                    time::interval(Duration::from_millis(interval_ms))
+                });
+        if let Some(interval) = periodic_interval.as_mut() {
+            interval.tick().await; // Skip first immediate tick
+        }
+
         #[cfg(feature = "tray")]
         if self.watch_config.enable_tray {
             return self
-                .process_events_with_tray_resilient(&mut rx, &mut sync_state, &mut interval)
+                .process_events_with_tray_resilient(
+                    &mut rx,
+                    &mut sync_state,
+                    &mut interval,
+                    &mut periodic_interval,
+                )
                 .await;
         }
 
-        self.process_events_loop(&mut rx, &mut sync_state, &mut interval, false)
-            .await
+        self.process_events_loop(
+            &mut rx,
+            &mut sync_state,
+            &mut interval,
+            &mut periodic_interval,
+            false,
+        )
+        .await
     }
 
     /// Core event loop without tray
     async fn process_events_loop(
         &self,
         rx: &mut mpsc::Receiver<Event>,
-        sync_state: &mut SyncState,
+        sync_state: &mut SyncScheduler,
         interval: &mut time::Interval,
+        periodic_interval: &mut Option<time::Interval>,
         paused: bool,
     ) -> Result<()> {
         loop {
@@ -315,6 +265,12 @@ impl WatchManager {
                         self.handle_file_event(event, sync_state);
                     }
                 }
+                _ = Self::tick_optional_interval(periodic_interval) => {
+                    if !paused {
+                        sync_state.request_sync_now();
+                        self.handle_timeout(sync_state).await;
+                    }
+                }
             }
         }
     }
@@ -328,8 +284,9 @@ impl WatchManager {
     async fn process_events_with_tray_resilient(
         &self,
         rx: &mut mpsc::Receiver<Event>,
-        sync_state: &mut SyncState,
+        sync_state: &mut SyncScheduler,
         interval: &mut time::Interval,
+        periodic_interval: &mut Option<time::Interval>,
     ) -> Result<()> {
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut tray_state = TrayState::new(PathBuf::from(&self.repo_path));
@@ -416,6 +373,10 @@ impl WatchManager {
                 }
                 Some(event) = rx.recv() => {
                     self.handle_file_event(event, sync_state);
+                }
+                _ = Self::tick_optional_interval(periodic_interval) => {
+                    sync_state.request_sync_now();
+                    self.handle_timeout_with_optional_tray(sync_state, &mut tray_state, &mut tray_handle).await;
                 }
                 Some(cmd) = cmd_rx.recv() => {
                     match cmd {
@@ -507,6 +468,15 @@ impl WatchManager {
                     }
                 }
             }
+        }
+    }
+
+    async fn tick_optional_interval(interval: &mut Option<time::Interval>) {
+        match interval {
+            Some(i) => {
+                i.tick().await;
+            }
+            None => pending::<()>().await,
         }
     }
 
@@ -745,7 +715,7 @@ impl WatchManager {
     #[cfg(feature = "tray")]
     async fn handle_timeout_with_optional_tray(
         &self,
-        sync_state: &mut SyncState,
+        sync_state: &mut SyncScheduler,
         tray_state: &mut TrayState,
         tray_handle: &mut Option<ksni::Handle<GitSyncTray>>,
     ) {
@@ -753,7 +723,7 @@ impl WatchManager {
             return;
         }
 
-        if !sync_state.should_sync() {
+        if !sync_state.should_sync_now() {
             return;
         }
 
@@ -770,7 +740,7 @@ impl WatchManager {
     #[cfg(feature = "tray")]
     async fn do_sync_with_optional_tray_update(
         &self,
-        sync_state: &mut SyncState,
+        sync_state: &mut SyncScheduler,
         tray_state: &mut TrayState,
         tray_handle: &mut Option<ksni::Handle<GitSyncTray>>,
     ) {
@@ -795,13 +765,14 @@ impl WatchManager {
         match self.perform_sync().await {
             Ok(()) => {
                 info!("Tray: perform_sync succeeded, setting status to Idle");
-                sync_state.record_sync();
+                sync_state.on_sync_success();
                 tray_state.status = TrayStatus::Idle;
                 tray_state.last_error = None;
                 self.reconcile_tray_state_from_global(tray_state, tray_handle)
                     .await;
             }
             Err(e) => {
+                sync_state.on_sync_failure(&e);
                 let err_msg = e.to_string();
                 self.log_sync_error(&e);
                 info!("Tray: perform_sync failed, setting status to Error");
@@ -813,42 +784,25 @@ impl WatchManager {
     }
 
     /// Handle a file system event
-    fn handle_file_event(&self, event: Event, sync_state: &mut SyncState) {
+    fn handle_file_event(&self, event: Event, sync_state: &mut SyncScheduler) {
         debug!("Received event from channel: {:?}", event);
         debug!("Event kind: {:?}, paths: {:?}", event.kind, event.paths);
 
-        // Use FileEventHandler's method to check relevance
-        // We can't easily share this without restructuring, so for now keep it simple
-        if self.is_relevant_change(&event) {
+        if EventFilter::is_relevant_change(&event) {
             info!("Relevant change detected, marking pending sync");
-            sync_state.mark_pending();
+            sync_state.mark_file_event();
         } else {
             debug!("Event not considered relevant: {:?}", event.kind);
         }
     }
 
-    /// Check if an event represents a relevant change
-    fn is_relevant_change(&self, event: &Event) -> bool {
-        let is_relevant = matches!(
-            event.kind,
-            EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-        );
-
-        debug!(
-            "is_relevant_change: kind={:?}, relevant={}",
-            event.kind, is_relevant
-        );
-
-        is_relevant
-    }
-
     /// Handle timeout expiration
-    async fn handle_timeout(&self, sync_state: &mut SyncState) {
+    async fn handle_timeout(&self, sync_state: &mut SyncScheduler) {
         if self.is_sync_suspended() {
             return;
         }
 
-        if !sync_state.should_sync() {
+        if !sync_state.should_sync_now() {
             return;
         }
 
@@ -870,9 +824,10 @@ impl WatchManager {
         match self.perform_sync().await {
             Ok(()) => {
                 debug!("perform_sync succeeded");
-                sync_state.record_sync();
+                sync_state.on_sync_success();
             }
             Err(e) => {
+                sync_state.on_sync_failure(&e);
                 self.log_sync_error(&e);
             }
         }
@@ -990,110 +945,286 @@ impl WatchManager {
     }
 }
 
-/// State for managing sync timing
-struct SyncState {
+/// Deadline/backoff based scheduler for watch-triggered sync attempts.
+///
+/// Behavior:
+/// - Coalesce events via quiet debounce window.
+/// - Prevent starvation with max batch latency under continuous event streams.
+/// - Apply retry backoff by error class on failures.
+struct SyncScheduler {
     last_sync: time::Instant,
     pending_sync: bool,
+    immediate_requested: bool,
     min_interval: Duration,
     debounce: Duration,
+    max_batch_latency: Duration,
+    first_event: Option<time::Instant>,
     last_event: Option<time::Instant>,
+    next_retry_at: Option<time::Instant>,
+    retry_backoff: Duration,
 }
 
-impl SyncState {
+impl SyncScheduler {
+    const RETRY_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+    const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(60);
+    const RETRY_DELAY_MANUAL: Duration = Duration::from_secs(30);
+    const RETRY_DELAY_CONFIG: Duration = Duration::from_secs(60);
+    const RETRY_DELAY_STATE: Duration = Duration::from_secs(5);
+
     fn new(debounce_ms: u64, min_interval_ms: u64) -> Self {
+        let debounce = Duration::from_millis(debounce_ms);
+        let min_interval = Duration::from_millis(min_interval_ms);
+        let max_batch_latency = debounce
+            .saturating_mul(8)
+            .max(min_interval)
+            .max(Duration::from_millis(500));
+
         Self {
             last_sync: time::Instant::now(),
             pending_sync: false,
-            min_interval: Duration::from_millis(min_interval_ms),
-            debounce: Duration::from_millis(debounce_ms),
+            immediate_requested: false,
+            min_interval,
+            debounce,
+            max_batch_latency,
+            first_event: None,
             last_event: None,
+            next_retry_at: None,
+            retry_backoff: Self::RETRY_BACKOFF_INITIAL,
         }
     }
 
-    fn mark_pending(&mut self) {
-        self.pending_sync = true;
-        self.last_event = Some(time::Instant::now());
+    fn mark_file_event(&mut self) {
+        self.mark_file_event_at(time::Instant::now());
     }
 
-    fn should_sync(&self) -> bool {
+    fn mark_file_event_at(&mut self, now: time::Instant) {
+        self.pending_sync = true;
+        self.immediate_requested = false;
+        self.first_event.get_or_insert(now);
+        self.last_event = Some(now);
+    }
+
+    fn request_sync_now(&mut self) {
+        self.request_sync_now_at(time::Instant::now());
+    }
+
+    fn request_sync_now_at(&mut self, now: time::Instant) {
+        self.pending_sync = true;
+        self.immediate_requested = true;
+        self.first_event.get_or_insert(now);
+        self.last_event.get_or_insert(now);
+    }
+
+    fn should_sync_now(&self) -> bool {
+        self.should_sync_at(time::Instant::now())
+    }
+
+    fn should_sync_at(&self, now: time::Instant) -> bool {
         if !self.pending_sync {
             return false;
         }
 
-        // Enforce minimum interval between syncs (throttle ensures progress)
-        let since_last_sync = self.last_sync.elapsed();
-        if since_last_sync < self.min_interval {
-            debug!("Too soon since last sync, waiting");
+        if let Some(next_retry_at) = self.next_retry_at {
+            if now < next_retry_at {
+                return false;
+            }
+        }
+
+        if now.duration_since(self.last_sync) < self.min_interval {
             return false;
         }
 
-        // Prefer to wait for quiet period, but do not starve: if min_interval
-        // has elapsed, allow sync even if events keep arriving.
-        if let Some(t) = self.last_event {
-            let since_last_event = t.elapsed();
-            if since_last_event < self.debounce {
-                debug!("Debounce active, but proceeding due to min-interval");
-            }
+        if self.immediate_requested {
+            return true;
         }
 
-        true
+        let quiet_ready = self
+            .last_event
+            .map(|last| now.duration_since(last) >= self.debounce)
+            .unwrap_or(false);
+        if quiet_ready {
+            return true;
+        }
+
+        self.first_event
+            .map(|first| now.duration_since(first) >= self.max_batch_latency)
+            .unwrap_or(false)
     }
 
-    fn record_sync(&mut self) {
-        self.last_sync = time::Instant::now();
+    fn on_sync_success(&mut self) {
+        self.on_sync_success_at(time::Instant::now());
+    }
+
+    fn on_sync_success_at(&mut self, now: time::Instant) {
+        self.last_sync = now;
         self.pending_sync = false;
+        self.immediate_requested = false;
+        self.first_event = None;
         self.last_event = None;
+        self.next_retry_at = None;
+        self.retry_backoff = Self::RETRY_BACKOFF_INITIAL;
+    }
+
+    fn on_sync_failure(&mut self, error: &SyncError) {
+        self.on_sync_failure_at(error, time::Instant::now());
+    }
+
+    fn on_sync_failure_at(&mut self, error: &SyncError, now: time::Instant) {
+        self.last_sync = now;
+        self.pending_sync = true;
+        self.immediate_requested = false;
+
+        let delay = self.retry_delay_for(error);
+        self.next_retry_at = Some(now + delay);
+        debug!(
+            delay_s = delay.as_secs_f64(),
+            error = %error,
+            "Sync failure scheduled with retry backoff"
+        );
+    }
+
+    fn retry_delay_for(&mut self, error: &SyncError) -> Duration {
+        match error {
+            SyncError::ManualInterventionRequired { .. } | SyncError::HookRejected { .. } => {
+                Self::RETRY_DELAY_MANUAL
+            }
+            SyncError::NoRemoteConfigured { .. }
+            | SyncError::RemoteBranchNotFound { .. }
+            | SyncError::NotARepository { .. } => Self::RETRY_DELAY_CONFIG,
+            SyncError::DetachedHead | SyncError::UnsafeRepositoryState { .. } => {
+                Self::RETRY_DELAY_STATE
+            }
+            _ => {
+                let delay = self.retry_backoff;
+                self.retry_backoff = self
+                    .retry_backoff
+                    .saturating_mul(2)
+                    .min(Self::RETRY_BACKOFF_MAX);
+                delay
+            }
+        }
     }
 }
 
-/// Run watch mode with periodic sync
+/// Run watch mode with periodic sync.
 pub async fn watch_with_periodic_sync(
     repo_path: impl AsRef<Path>,
     sync_config: SyncConfig,
-    watch_config: WatchConfig,
+    mut watch_config: WatchConfig,
     sync_interval_ms: Option<u64>,
 ) -> Result<()> {
+    watch_config.periodic_sync_interval_ms = sync_interval_ms;
     let manager = WatchManager::new(repo_path, sync_config, watch_config);
+    manager.watch().await
+}
 
-    if let Some(interval_ms) = sync_interval_ms {
-        // Run with periodic sync
-        info!(
-            "Periodic sync enabled (interval: {}s)",
-            interval_ms as f64 / 1000.0
-        );
+#[cfg(test)]
+mod scheduler_tests {
+    use super::SyncScheduler;
+    use crate::error::SyncError;
+    use tokio::time::{Duration, Instant};
 
-        let manager_clone = Arc::new(manager);
-        let manager_watch = manager_clone.clone();
+    #[test]
+    fn scheduler_waits_for_quiet_period_before_syncing() {
+        let mut scheduler = SyncScheduler::new(200, 100);
+        let base = Instant::now();
+        scheduler.last_sync = base;
+        scheduler.mark_file_event_at(base);
 
-        // Start watch task
-        let watch_handle = tokio::spawn(async move { manager_watch.watch().await });
+        assert!(!scheduler.should_sync_at(base));
+        assert!(!scheduler.should_sync_at(base + Duration::from_millis(120)));
+        assert!(scheduler.should_sync_at(base + Duration::from_millis(220)));
+    }
 
-        // Start periodic sync task
-        let periodic_handle = tokio::spawn(async move {
-            let mut interval = time::interval(Duration::from_millis(interval_ms));
-            interval.tick().await; // Skip first immediate tick
+    #[test]
+    fn scheduler_uses_max_batch_latency_to_prevent_starvation() {
+        let mut scheduler = SyncScheduler::new(500, 100);
+        let base = Instant::now();
+        scheduler.last_sync = base;
+        scheduler.mark_file_event_at(base);
 
-            loop {
-                interval.tick().await;
-                if manager_clone.is_sync_suspended() {
-                    debug!("Periodic sync skipped: syncing suspended");
-                    continue;
-                }
-                info!("Periodic sync triggered");
-                if let Err(e) = manager_clone.perform_sync().await {
-                    error!("Periodic sync failed: {}", e);
-                }
-            }
-        });
-
-        // Wait for either task to finish (they shouldn't normally)
-        tokio::select! {
-            result = watch_handle => result?,
-            result = periodic_handle => result?,
+        // Keep sending events faster than debounce; sync should still eventually fire.
+        for i in 1..40 {
+            let t = base + Duration::from_millis(100 * i);
+            scheduler.mark_file_event_at(t);
+            assert!(
+                !scheduler.should_sync_at(t),
+                "Scheduler should still wait before max-batch threshold"
+            );
         }
-    } else {
-        // Just run watch mode
-        manager.watch().await
+
+        let ready_at = base + Duration::from_millis(4000);
+        scheduler.mark_file_event_at(ready_at);
+        assert!(
+            scheduler.should_sync_at(ready_at),
+            "Scheduler should fire at max-batch latency under continuous events"
+        );
+    }
+
+    #[test]
+    fn scheduler_applies_retry_backoff_and_resets_on_success() {
+        let mut scheduler = SyncScheduler::new(0, 0);
+        let base = Instant::now();
+        scheduler.last_sync = base;
+        scheduler.mark_file_event_at(base);
+        assert!(scheduler.should_sync_at(base));
+
+        scheduler.on_sync_failure_at(&SyncError::NetworkError("transient".to_string()), base);
+        assert!(!scheduler.should_sync_at(base + Duration::from_millis(999)));
+        assert!(scheduler.should_sync_at(base + Duration::from_millis(1000)));
+
+        let second = base + Duration::from_millis(1000);
+        scheduler.on_sync_failure_at(&SyncError::NetworkError("transient".to_string()), second);
+        assert!(!scheduler.should_sync_at(second + Duration::from_secs(1)));
+        assert!(scheduler.should_sync_at(second + Duration::from_secs(2)));
+
+        scheduler.on_sync_success_at(second + Duration::from_secs(2));
+        let next = second + Duration::from_secs(2);
+        scheduler.mark_file_event_at(next);
+        assert!(scheduler.should_sync_at(next));
+    }
+
+    #[test]
+    fn scheduler_uses_longer_retry_for_manual_intervention_errors() {
+        let mut scheduler = SyncScheduler::new(0, 0);
+        let base = Instant::now();
+        scheduler.last_sync = base;
+        scheduler.mark_file_event_at(base);
+        assert!(scheduler.should_sync_at(base));
+
+        scheduler.on_sync_failure_at(
+            &SyncError::ManualInterventionRequired {
+                reason: "conflict".to_string(),
+            },
+            base,
+        );
+        assert!(!scheduler.should_sync_at(base + Duration::from_secs(29)));
+        assert!(scheduler.should_sync_at(base + Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn request_sync_now_bypasses_debounce_but_respects_min_interval() {
+        let mut scheduler = SyncScheduler::new(10_000, 500);
+        let base = Instant::now();
+        scheduler.last_sync = base;
+
+        scheduler.request_sync_now_at(base + Duration::from_millis(100));
+        assert!(!scheduler.should_sync_at(base + Duration::from_millis(499)));
+        assert!(scheduler.should_sync_at(base + Duration::from_millis(500)));
+    }
+
+    #[test]
+    fn request_sync_now_does_not_bypass_retry_backoff() {
+        let mut scheduler = SyncScheduler::new(0, 0);
+        let base = Instant::now();
+        scheduler.last_sync = base;
+        scheduler.mark_file_event_at(base);
+        assert!(scheduler.should_sync_at(base));
+
+        scheduler.on_sync_failure_at(&SyncError::NetworkError("transient".to_string()), base);
+        scheduler.request_sync_now_at(base + Duration::from_millis(100));
+        assert!(!scheduler.should_sync_at(base + Duration::from_millis(999)));
+        assert!(scheduler.should_sync_at(base + Duration::from_millis(1000)));
     }
 }
 

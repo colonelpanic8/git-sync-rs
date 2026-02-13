@@ -213,6 +213,7 @@ async fn run(cli: Cli) -> Result<()> {
                 dry_run: cli.dry_run,
                 enable_tray,
                 tray_icon,
+                periodic_sync_interval_ms: None,
             };
 
             let interval_ms = Some(config.defaults.sync_interval * 1000);
@@ -263,6 +264,7 @@ async fn run(cli: Cli) -> Result<()> {
                 dry_run: cli.dry_run,
                 enable_tray,
                 tray_icon,
+                periodic_sync_interval_ms: None,
             };
 
             // Use interval from CLI or defaults (repo config would need separate loading)
