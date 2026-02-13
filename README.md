@@ -41,6 +41,9 @@ git-sync-rs /path/to/repo watch
 
 # Watch with custom intervals
 git-sync-rs /path/to/repo watch --debounce 2 --interval 300
+
+# Print version and commit hash
+git-sync-rs version
 ```
 
 ### Environment Variables
@@ -100,6 +103,7 @@ remote_name = "backup"
 - `-v, --verbose` - Enable verbose output
 - `-q, --quiet` - Suppress non-error output
 - `--config <path>` - Use alternate config file
+- `version` - Print semantic version and git commit hash
 
 ## Compatibility
 

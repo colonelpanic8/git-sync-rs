@@ -11,7 +11,7 @@ use tracing::{error, info};
 
 #[derive(Parser)]
 #[command(name = "git-sync-rs")]
-#[command(about = "Automatically sync git repositories", long_about = None)]
+#[command(version, about = "Automatically sync git repositories", long_about = None)]
 struct Cli {
     /// Repository path to sync (defaults to current directory)
     #[arg(value_name = "PATH")]
@@ -102,6 +102,9 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+
+    /// Show version information
+    Version,
 }
 
 #[tokio::main]
@@ -141,6 +144,9 @@ async fn run(cli: Cli) -> Result<()> {
     // Handle init command first (doesn't need repo)
     if let Some(Commands::Init { force }) = &cli.command {
         return init_config(*force);
+    }
+    if let Some(Commands::Version) = &cli.command {
+        return print_version();
     }
 
     // Get repository path (priority: -d flag > positional arg > env var > config)
@@ -283,11 +289,18 @@ async fn run(cli: Cli) -> Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!(e))
         }
-        Some(Commands::Init { .. }) => {
+    Some(Commands::Init { .. }) => {
             // Already handled above
             unreachable!()
         }
     }
+}
+
+fn print_version() -> Result<()> {
+    let version = env!("CARGO_PKG_VERSION");
+    let commit = option_env!("GIT_COMMIT_HASH").unwrap_or("unknown");
+    println!("git-sync-rs {version} (git commit {commit})");
+    Ok(())
 }
 
 async fn run_check(repo_path: &std::path::Path, config: SyncConfig) -> Result<()> {
