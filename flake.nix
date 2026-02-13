@@ -38,7 +38,7 @@
         mkGitSyncPackage = { pname, buildFeatures ? [], extraBuildInputs ? [], extraNativeBuildInputs ? [] }:
           pkgs.rustPlatform.buildRustPackage ({
             inherit pname;
-            version = "0.4.0";
+            version = "0.7.1";
 
             src = ./.;
 
