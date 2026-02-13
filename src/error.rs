@@ -14,6 +14,9 @@ pub enum SyncError {
     #[error("No remote configured for branch {branch}")]
     NoRemoteConfigured { branch: String },
 
+    #[error("Remote branch not found: {remote}/{branch}")]
+    RemoteBranchNotFound { remote: String, branch: String },
+
     #[error("Branch {branch} not configured for sync")]
     BranchNotConfigured { branch: String },
 
@@ -22,6 +25,15 @@ pub enum SyncError {
 
     #[error("Network error: {0}")]
     NetworkError(String),
+
+    #[error("Authentication failed during {operation}")]
+    AuthenticationFailed { operation: String },
+
+    #[error("Git command failed: {command}\n{stderr}")]
+    GitCommandFailed { command: String, stderr: String },
+
+    #[error("Git hooks rejected commit: {details}")]
+    HookRejected { details: String },
 
     #[error("Git error: {0}")]
     GitError(#[from] git2::Error),
@@ -47,9 +59,13 @@ impl SyncError {
             SyncError::UnsafeRepositoryState { .. } => 2,
             SyncError::DetachedHead => 2,
             SyncError::NoRemoteConfigured { .. } => 2,
+            SyncError::RemoteBranchNotFound { .. } => 2,
             SyncError::BranchNotConfigured { .. } => 1,
             SyncError::ManualInterventionRequired { .. } => 1,
             SyncError::NetworkError(_) => 3,
+            SyncError::AuthenticationFailed { .. } => 3,
+            SyncError::GitCommandFailed { .. } => 2,
+            SyncError::HookRejected { .. } => 1,
             SyncError::GitError(e) => {
                 // Map git2 errors to appropriate exit codes
                 match e.code() {
