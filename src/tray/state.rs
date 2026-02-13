@@ -20,7 +20,7 @@ pub enum TrayStatus {
 #[derive(Debug, Clone)]
 pub enum TrayCommand {
     SyncNow,
-    Pause,
+    Suspend,
     Resume,
     Quit,
     /// Internal command: request the tray service be restarted.
@@ -46,7 +46,7 @@ impl TrayState {
 
     pub fn status_text(&self) -> String {
         if self.paused {
-            return "Paused".to_string();
+            return "Suspended".to_string();
         }
         match &self.status {
             TrayStatus::Idle => "Idle".to_string(),

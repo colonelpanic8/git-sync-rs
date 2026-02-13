@@ -281,10 +281,10 @@ impl ksni::Tray for GitSyncTray {
         } else {
             items.push(
                 StandardItem {
-                    label: "Pause".into(),
+                    label: "Suspend".into(),
                     icon_name: "media-playback-pause".into(),
                     activate: Box::new(|this: &mut Self| {
-                        let _ = this.cmd_tx.send(TrayCommand::Pause);
+                        let _ = this.cmd_tx.send(TrayCommand::Suspend);
                     }),
                     ..Default::default()
                 }

@@ -66,6 +66,7 @@ pub struct WatchManager {
     sync_config: SyncConfig,
     watch_config: WatchConfig,
     is_syncing: Arc<AtomicBool>,
+    sync_suspended: Arc<AtomicBool>,
     last_successful_sync_unix_secs: Arc<AtomicI64>,
     #[cfg(feature = "tray")]
     last_sync_error: Arc<RwLock<Option<String>>>,
@@ -216,6 +217,7 @@ impl WatchManager {
             sync_config,
             watch_config,
             is_syncing: Arc::new(AtomicBool::new(false)),
+            sync_suspended: Arc::new(AtomicBool::new(false)),
             last_successful_sync_unix_secs: Arc::new(AtomicI64::new(0)),
             #[cfg(feature = "tray")]
             last_sync_error: Arc::new(RwLock::new(None)),
@@ -402,9 +404,7 @@ impl WatchManager {
                         ));
                     }
 
-                    if !tray_state.paused {
-                        self.handle_timeout_with_optional_tray(sync_state, &mut tray_state, &mut tray_handle).await;
-                    }
+                    self.handle_timeout_with_optional_tray(sync_state, &mut tray_state, &mut tray_handle).await;
                     self.reconcile_tray_state_from_global(&mut tray_state, &mut tray_handle)
                         .await;
                     self.refresh_tray_relative_time_display(
@@ -415,29 +415,29 @@ impl WatchManager {
                     .await;
                 }
                 Some(event) = rx.recv() => {
-                    if !tray_state.paused {
-                        self.handle_file_event(event, sync_state);
-                    }
+                    self.handle_file_event(event, sync_state);
                 }
                 Some(cmd) = cmd_rx.recv() => {
                     match cmd {
                         TrayCommand::SyncNow => {
                             if tray_state.paused {
-                                debug!("Tray: manual sync requested while paused; ignoring");
+                                debug!("Tray: manual sync requested while suspended; ignoring");
                             } else {
                                 info!("Tray: manual sync requested");
                                 self.do_sync_with_optional_tray_update(sync_state, &mut tray_state, &mut tray_handle).await;
                             }
                         }
-                        TrayCommand::Pause => {
-                            info!("Tray: pausing sync");
-                            tray_state.paused = true;
-                            self.tray_apply_state(&mut tray_handle, &tray_state).await;
+                        TrayCommand::Suspend => {
+                            info!("Tray: suspending all sync activity");
+                            self.set_sync_suspended(true);
+                            self.reconcile_tray_state_from_global(&mut tray_state, &mut tray_handle)
+                                .await;
                         }
                         TrayCommand::Resume => {
-                            info!("Tray: resuming sync");
-                            tray_state.paused = false;
-                            self.tray_apply_state(&mut tray_handle, &tray_state).await;
+                            info!("Tray: resuming sync activity");
+                            self.set_sync_suspended(false);
+                            self.reconcile_tray_state_from_global(&mut tray_state, &mut tray_handle)
+                                .await;
                         }
                         TrayCommand::Quit => {
                             info!("Tray: quit requested");
@@ -659,6 +659,12 @@ impl WatchManager {
         tray_handle: &mut Option<ksni::Handle<GitSyncTray>>,
     ) {
         let mut changed = false;
+        let paused = self.is_sync_suspended();
+
+        if tray_state.paused != paused {
+            tray_state.paused = paused;
+            changed = true;
+        }
 
         if !tray_state.paused {
             let desired_status = self.desired_tray_status().await;
@@ -743,6 +749,10 @@ impl WatchManager {
         tray_state: &mut TrayState,
         tray_handle: &mut Option<ksni::Handle<GitSyncTray>>,
     ) {
+        if self.is_sync_suspended() {
+            return;
+        }
+
         if !sync_state.should_sync() {
             return;
         }
@@ -764,6 +774,11 @@ impl WatchManager {
         tray_state: &mut TrayState,
         tray_handle: &mut Option<ksni::Handle<GitSyncTray>>,
     ) {
+        if self.is_sync_suspended() {
+            debug!("Sync is suspended, skipping tray-triggered sync");
+            return;
+        }
+
         info!("Tray: setting status to Syncing");
         tray_state.status = TrayStatus::Syncing;
         self.tray_apply_state(tray_handle, tray_state).await;
@@ -829,6 +844,10 @@ impl WatchManager {
 
     /// Handle timeout expiration
     async fn handle_timeout(&self, sync_state: &mut SyncState) {
+        if self.is_sync_suspended() {
+            return;
+        }
+
         if !sync_state.should_sync() {
             return;
         }
@@ -896,6 +915,11 @@ impl WatchManager {
 
     /// Perform a synchronization
     async fn perform_sync(&self) -> Result<()> {
+        if self.is_sync_suspended() {
+            debug!("Sync is suspended, skipping sync attempt");
+            return Ok(());
+        }
+
         // Set syncing flag (lock-free)
         if self.is_syncing.swap(true, Ordering::AcqRel) {
             debug!("Sync already in progress");
@@ -953,6 +977,16 @@ impl WatchManager {
             debug!("perform_sync finished successfully");
         }
         result
+    }
+
+    fn is_sync_suspended(&self) -> bool {
+        self.sync_suspended.load(Ordering::Acquire)
+    }
+
+    #[cfg(feature = "tray")]
+    fn set_sync_suspended(&self, suspended: bool) {
+        self.sync_suspended.store(suspended, Ordering::Release);
+        self.notify_sync_state_changed();
     }
 }
 
@@ -1041,6 +1075,10 @@ pub async fn watch_with_periodic_sync(
 
             loop {
                 interval.tick().await;
+                if manager_clone.is_sync_suspended() {
+                    debug!("Periodic sync skipped: syncing suspended");
+                    continue;
+                }
                 info!("Periodic sync triggered");
                 if let Err(e) = manager_clone.perform_sync().await {
                     error!("Periodic sync failed: {}", e);
@@ -1061,8 +1099,10 @@ pub async fn watch_with_periodic_sync(
 
 #[cfg(all(test, feature = "tray"))]
 mod tests {
-    use super::WatchManager;
+    use super::{WatchConfig, WatchManager};
+    use crate::sync::SyncConfig;
     use std::fs::File;
+    use std::sync::atomic::Ordering;
     use tempfile::tempdir;
     use tokio::time::{timeout, Duration};
 
@@ -1102,5 +1142,28 @@ mod tests {
             .await
             .expect("timed out waiting for watcher event");
         assert_eq!(received, Some(()));
+    }
+
+    #[tokio::test]
+    async fn perform_sync_is_noop_when_suspended() {
+        let manager = WatchManager::new(
+            "/tmp/not-a-repo",
+            SyncConfig::default(),
+            WatchConfig::default(),
+        );
+        manager.set_sync_suspended(true);
+
+        manager
+            .perform_sync()
+            .await
+            .expect("suspended sync should be a no-op");
+
+        assert_eq!(
+            manager
+                .last_successful_sync_unix_secs
+                .load(Ordering::Acquire),
+            0
+        );
+        assert!(!manager.is_syncing.load(Ordering::Acquire));
     }
 }
