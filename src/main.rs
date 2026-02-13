@@ -300,6 +300,10 @@ async fn run(cli: Cli) -> Result<()> {
             // Already handled above
             unreachable!()
         }
+        Some(Commands::Version) => {
+            // Already handled above
+            unreachable!()
+        }
     }
 }
 
