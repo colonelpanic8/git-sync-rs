@@ -2,7 +2,7 @@ mod common;
 
 use anyhow::Result;
 use common::TestRepoSetup;
-use git_sync_rs::{RepositorySynchronizer, SyncConfig};
+use git_sync_rs::{RepositorySynchronizer, SyncConfig, SyncError, SyncState};
 use std::fs;
 
 #[test]
@@ -38,11 +38,17 @@ fn handle_merge_conflict_with_local_changes() -> Result<()> {
     let mut sync = RepositorySynchronizer::new_with_detected_branch(&setup.local_path, config)?;
     let result = sync.sync(false);
 
-    // Should handle conflict (either merge or fail gracefully)
-    if result.is_ok() {
-        // If merge succeeded, file should contain merge markers or resolved content
-        let content = fs::read_to_string(setup.local_path.join("data.txt"))?;
-        assert!(content.contains("line1") && content.contains("line3"));
+    match result {
+        Ok(()) => {
+            // If merge resolved automatically, sync must complete and repository must be aligned.
+            let content = fs::read_to_string(setup.local_path.join("data.txt"))?;
+            assert!(content.contains("line1") && content.contains("line3"));
+            assert_eq!(sync.get_sync_state()?, SyncState::Equal);
+        }
+        Err(SyncError::ManualInterventionRequired { .. }) => {
+            // Conflict could not be resolved automatically.
+        }
+        Err(e) => panic!("Unexpected sync error for conflict case: {e:?}"),
     }
 
     Ok(())
@@ -84,14 +90,12 @@ fn conflict_resolution_with_merge() -> Result<()> {
     let mut synchronizer =
         RepositorySynchronizer::new_with_detected_branch(&setup.local_path, sync_config)?;
 
-    // This might fail if there's a conflict that can't be auto-resolved
-    // In a real scenario, git-sync-rs should handle this gracefully
+    // This conflict should require manual intervention when fallback branches are disabled.
     let result = synchronizer.sync(false);
 
-    // Check that sync attempted to handle the situation
     assert!(
-        result.is_ok() || result.is_err(),
-        "Sync should either succeed or fail gracefully"
+        matches!(result, Err(SyncError::ManualInterventionRequired { .. })),
+        "Expected manual intervention for an unresolvable merge conflict, got: {result:?}"
     );
 
     Ok(())
