@@ -371,7 +371,43 @@ impl RepositorySynchronizer {
 
         if self.config.sync_new_files {
             // Add all changes including new files
-            index.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)?;
+            //
+            // libgit2 can surface untracked nested repositories (e.g. git worktrees) as a
+            // directory path with a trailing slash like `.worktrees/foo/`. Those directory
+            // marker paths are not valid index paths, so attempting to add them fails with:
+            //   invalid path: '.../'; class=Index (10)
+            //
+            // Use an `add_all` callback to skip these directory markers, and (when they look
+            // like nested repos) skip their contents too.
+            let repo_root = self._repo_path.clone();
+            let mut nested_repo_prefixes: Vec<String> = Vec::new();
+            let mut cb = |path: &Path, _matched_spec: &[u8]| -> i32 {
+                let path_s = path.to_string_lossy();
+
+                // Skip anything under a nested git repo we already detected.
+                if nested_repo_prefixes.iter().any(|p| path_s.starts_with(p)) {
+                    return 1;
+                }
+
+                // Avoid ever attempting to add `.git` internals (for nested repos).
+                if path_s.contains("/.git/") || path_s.ends_with("/.git") {
+                    return 1;
+                }
+
+                // Skip directory markers (they are not valid index paths). If it looks like a
+                // nested git repo, remember the prefix so we skip its contents too.
+                if path_s.ends_with('/') {
+                    let no_slash = path_s.trim_end_matches('/');
+                    if repo_root.join(no_slash).join(".git").exists() {
+                        nested_repo_prefixes.push(format!("{}/", no_slash));
+                    }
+                    return 1;
+                }
+
+                0
+            };
+
+            index.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, Some(&mut cb))?;
         } else {
             // Only update tracked files
             index.update_all(["*"].iter(), None)?;
