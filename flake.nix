@@ -19,6 +19,16 @@
         };
         cargoManifest = builtins.fromTOML (builtins.readFile ./Cargo.toml);
         packageVersion = cargoManifest.package.version;
+        gitCommitHash =
+          if self ? shortRev
+          then self.shortRev
+          else if self ? dirtyShortRev
+          then self.dirtyShortRev
+          else if self ? rev
+          then builtins.substring 0 12 self.rev
+          else if self ? dirtyRev
+          then builtins.substring 0 12 self.dirtyRev
+          else "unknown";
         commonBuildInputs = with pkgs;
           [
             openssl
@@ -41,6 +51,7 @@
           pkgs.rustPlatform.buildRustPackage ({
             inherit pname;
             version = packageVersion;
+            GIT_COMMIT_HASH = gitCommitHash;
 
             src = ./.;
 

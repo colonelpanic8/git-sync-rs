@@ -3,12 +3,20 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
-    let commit = get_git_commit().unwrap_or_else(|_| "unknown".to_string());
+    let commit = std::env::var("GIT_COMMIT_HASH")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| get_git_commit().ok())
+        .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=GIT_COMMIT_HASH={}", commit);
 
     // Ensure we rerun the build script when HEAD advances (normal commits do not change `.git/HEAD`).
-    if let Ok(git_dir) = get_git_dir() {
-        emit_rerun_if_git_head_changes(&git_dir);
+    // If GIT_COMMIT_HASH is injected by the builder (e.g. Nix), we don't need
+    // git-dir based rerun tracking.
+    if std::env::var_os("GIT_COMMIT_HASH").is_none() {
+        if let Ok(git_dir) = get_git_dir() {
+            emit_rerun_if_git_head_changes(&git_dir);
+        }
     }
 }
 
