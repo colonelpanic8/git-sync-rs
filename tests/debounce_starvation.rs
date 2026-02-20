@@ -79,7 +79,9 @@ async fn continuous_changes_starve_debounce() -> Result<()> {
         Result::<()>::Ok(())
     })
     .await
-    .map_err(|_| anyhow::anyhow!("Timed out waiting for burst.txt to be synced during continuous changes"))??;
+    .map_err(|_| {
+        anyhow::anyhow!("Timed out waiting for burst.txt to be synced during continuous changes")
+    })??;
 
     // Ensure the writer task completed successfully.
     writer.await??;
