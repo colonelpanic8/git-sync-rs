@@ -17,6 +17,8 @@
         pkgs = import nixpkgs {
           inherit system overlays;
         };
+        cargoManifest = builtins.fromTOML (builtins.readFile ./Cargo.toml);
+        packageVersion = cargoManifest.package.version;
         commonBuildInputs = with pkgs;
           [
             openssl
@@ -38,7 +40,7 @@
         mkGitSyncPackage = { pname, buildFeatures ? [], extraBuildInputs ? [], extraNativeBuildInputs ? [] }:
           pkgs.rustPlatform.buildRustPackage ({
             inherit pname;
-            version = "0.7.1";
+            version = packageVersion;
 
             src = ./.;
 
