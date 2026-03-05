@@ -251,14 +251,9 @@ impl GitTransport for CommandGitTransport {
                                 combined.trim(),
                                 retry_combined.trim()
                             );
-                            Err(self.classify_git_error(
-                                "git commit",
-                                &combined_errors,
-                                None,
-                                None,
-                            ))
+                            Err(self.classify_git_error("git commit", &combined_errors, None, None))
                         }
-                    }
+                    };
                 }
 
                 Err(self.classify_git_error("git commit", &combined, None, None))
