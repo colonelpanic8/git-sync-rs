@@ -63,16 +63,19 @@ Watch mode monitors your repository for changes and automatically syncs them:
 
 ```bash
 # Basic watch mode
-git-sync-rs watch /path/to/repo
+git-sync-rs /path/to/repo watch
 
 # With custom debounce (wait 2 seconds after changes)
-git-sync-rs watch /path/to/repo --debounce 2
+git-sync-rs /path/to/repo watch --debounce 2
 
 # With periodic sync every 5 minutes
-git-sync-rs watch /path/to/repo --interval 300
+git-sync-rs /path/to/repo watch --interval 300
 
 # Dry run mode (detect changes but don't sync)
-git-sync-rs watch /path/to/repo --dry-run
+git-sync-rs /path/to/repo watch --dry-run
+
+# Run watch mode for multiple repos from config
+git-sync-rs watch
 ```
 
 ### Configuration File
@@ -84,16 +87,23 @@ Create a configuration file at `~/.config/git-sync-rs/config.toml`:
 sync_interval = 300
 sync_new_files = true
 commit_message = "Auto-sync: {hostname} at {timestamp}"
-remote_name = "origin"
+remote = "origin"
 
 [[repositories]]
 path = "~/my-notes"
 sync_new_files = true
+watch = true
 
 [[repositories]]
 path = "~/my-docs"
-remote_name = "backup"
+remote = "backup"
+watch = true
 ```
+
+When no repository path is passed:
+- `git-sync-rs watch` (and default watch mode) runs all repositories with `watch = true` in `[[repositories]]`.
+- If no repo has `watch = true`, watch mode runs all configured repositories.
+- `git-sync-rs check` and `git-sync-rs sync` run across all configured repositories.
 
 ## Command Line Options
 
