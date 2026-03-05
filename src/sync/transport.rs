@@ -233,7 +233,7 @@ impl GitTransport for CommandGitTransport {
             .map_err(|e| SyncError::Other(format!("Failed to run git commit: {}", e)))?;
 
         match Self::parse_commit_output(&output) {
-            Ok(outcome) => return Ok(outcome),
+            Ok(outcome) => Ok(outcome),
             Err(combined) => {
                 if Self::is_missing_identity_error(&combined) {
                     let (name, email) = Self::fallback_commit_identity();
@@ -243,20 +243,20 @@ impl GitTransport for CommandGitTransport {
                             SyncError::Other(format!("Failed to rerun git commit: {}", e))
                         })?;
 
-                    match Self::parse_commit_output(&retry) {
-                        Ok(outcome) => return Ok(outcome),
+                    return match Self::parse_commit_output(&retry) {
+                        Ok(outcome) => Ok(outcome),
                         Err(retry_combined) => {
                             let combined_errors = format!(
                                 "git commit failed due to missing identity, fallback identity retry also failed.\n\ninitial:\n{}\n\nfallback retry:\n{}",
                                 combined.trim(),
                                 retry_combined.trim()
                             );
-                            return Err(self.classify_git_error(
+                            Err(self.classify_git_error(
                                 "git commit",
                                 &combined_errors,
                                 None,
                                 None,
-                            ));
+                            ))
                         }
                     }
                 }
