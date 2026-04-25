@@ -4,6 +4,7 @@ use anyhow::Result;
 use common::TestRepoSetup;
 use git_sync_rs::{watch_with_periodic_sync, SyncConfig, WatchConfig};
 use std::fs;
+use std::path::Path;
 use std::time::Duration;
 
 #[tokio::test]
@@ -57,15 +58,37 @@ async fn file_changes_trigger_sync() -> Result<()> {
         "Content added during watch\n",
     )?;
 
-    // Wait for sync to happen
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    // Pull in second clone and verify file was synced
-    setup.pull_in(&second_clone)?;
-    setup.assert_file_content_in(&second_clone, "newfile.txt", "Content added during watch\n")?;
+    wait_for_file_in_clone(
+        &setup,
+        &second_clone,
+        "newfile.txt",
+        "Content added during watch\n",
+    )
+    .await?;
 
     // Cancel the watch task
     watch_handle.abort();
 
     Ok(())
+}
+
+async fn wait_for_file_in_clone(
+    setup: &TestRepoSetup,
+    clone_path: &Path,
+    filename: &str,
+    expected: &str,
+) -> Result<()> {
+    for _ in 0..50 {
+        let _ = setup.pull_in(clone_path);
+
+        match fs::read_to_string(clone_path.join(filename)) {
+            Ok(content) if content == expected => return Ok(()),
+            Ok(_) | Err(_) => {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    }
+
+    setup.pull_in(clone_path)?;
+    setup.assert_file_content_in(clone_path, filename, expected)
 }

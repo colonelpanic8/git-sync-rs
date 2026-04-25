@@ -1,6 +1,6 @@
 use git2::Repository;
 use notify::{Event, EventKind};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tracing::debug;
 
 pub(super) struct EventFilter;
@@ -60,7 +60,10 @@ impl EventFilter {
     }
 
     fn should_ignore_path(repo: &Repository, repo_path: &Path, file_path: &Path) -> bool {
-        let relative_path = match file_path.strip_prefix(repo_path) {
+        let repo_path = Self::canonicalize_if_possible(repo_path);
+        let file_path = Self::canonicalize_if_possible(file_path);
+
+        let relative_path = match file_path.strip_prefix(&repo_path) {
             Ok(p) => p,
             Err(_) => {
                 debug!("Path {:?} is outside repo, ignoring", file_path);
@@ -83,5 +86,9 @@ impl EventFilter {
                 false
             }
         }
+    }
+
+    fn canonicalize_if_possible(path: &Path) -> PathBuf {
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
     }
 }
