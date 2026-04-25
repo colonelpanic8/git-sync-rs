@@ -67,6 +67,42 @@
             ] ++ extraNativeBuildInputs;
 
             buildInputs = commonBuildInputs ++ extraBuildInputs;
+
+            postInstall = ''
+              cat > "$out/bin/git-sync" <<'EOF'
+              #!${pkgs.runtimeShell}
+              set -eu
+
+              translated_args=()
+
+              while [ "$#" -gt 0 ]; do
+                case "$1" in
+                  -s|--sync)
+                    shift
+                    ;;
+                  -n|--new-files)
+                    translated_args+=(--new-files=true)
+                    shift
+                    ;;
+                  *)
+                    translated_args+=("$1")
+                    shift
+                    ;;
+                esac
+              done
+
+              exec "$(dirname "$0")/git-sync-rs" "''${translated_args[@]}" sync
+              EOF
+              chmod +x "$out/bin/git-sync"
+
+              cat > "$out/bin/git-sync-on-inotify" <<'EOF'
+              #!${pkgs.runtimeShell}
+              set -eu
+
+              exec "$(dirname "$0")/git-sync-rs" "$@" watch
+              EOF
+              chmod +x "$out/bin/git-sync-on-inotify"
+            '';
           } // commonEnv);
       in {
         devShells.default = pkgs.mkShell {
