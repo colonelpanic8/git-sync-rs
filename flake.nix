@@ -111,8 +111,12 @@
               dbus
 
               # Rust toolchain
-              (rust-bin.stable.latest.default.override {
-                extensions = ["rust-src"];
+              (rust-bin.stable.latest.minimal.override {
+                extensions = [
+                  "clippy"
+                  "rust-src"
+                  "rustfmt"
+                ];
               })
             ];
 

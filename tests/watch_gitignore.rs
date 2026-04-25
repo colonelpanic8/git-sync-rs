@@ -4,6 +4,7 @@ use anyhow::Result;
 use common::TestRepoSetup;
 use git_sync_rs::{watch_with_periodic_sync, SyncConfig, WatchConfig};
 use std::fs;
+use std::path::Path;
 use std::time::Duration;
 
 #[tokio::test]
@@ -52,14 +53,9 @@ async fn gitignored_files_not_synced() -> Result<()> {
     fs::write(setup.local_path.join("build/output.txt"), "Build output\n")?;
     fs::write(setup.local_path.join("normal.txt"), "Normal file\n")?;
 
-    // Wait for sync
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    wait_for_file_in_clone(&setup, &second_clone, "normal.txt", "Normal file\n").await?;
 
-    // Pull in second clone
-    setup.pull_in(&second_clone)?;
-
-    // Verify only non-ignored file was synced
-    setup.assert_file_content_in(&second_clone, "normal.txt", "Normal file\n")?;
+    // Verify only non-ignored files were omitted from the clone after sync.
     assert!(
         !second_clone.join("debug.log").exists(),
         "Log file should not be synced"
@@ -76,4 +72,25 @@ async fn gitignored_files_not_synced() -> Result<()> {
     watch_handle.abort();
 
     Ok(())
+}
+
+async fn wait_for_file_in_clone(
+    setup: &TestRepoSetup,
+    clone_path: &Path,
+    filename: &str,
+    expected: &str,
+) -> Result<()> {
+    for _ in 0..50 {
+        let _ = setup.pull_in(clone_path);
+
+        match fs::read_to_string(clone_path.join(filename)) {
+            Ok(content) if content == expected => return Ok(()),
+            Ok(_) | Err(_) => {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    }
+
+    setup.pull_in(clone_path)?;
+    setup.assert_file_content_in(clone_path, filename, expected)
 }
