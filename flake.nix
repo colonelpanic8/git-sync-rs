@@ -33,11 +33,6 @@
           [
             openssl
             libgit2
-          ]
-          ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
-            darwin.apple_sdk.frameworks.Security
-            darwin.apple_sdk.frameworks.CoreFoundation
-            darwin.apple_sdk.frameworks.SystemConfiguration
           ];
 
         commonEnv = {
@@ -119,11 +114,6 @@
               (rust-bin.stable.latest.default.override {
                 extensions = ["rust-src"];
               })
-            ]
-            ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
-              darwin.apple_sdk.frameworks.Security
-              darwin.apple_sdk.frameworks.CoreFoundation
-              darwin.apple_sdk.frameworks.SystemConfiguration
             ];
 
           # Environment variables for OpenSSL
