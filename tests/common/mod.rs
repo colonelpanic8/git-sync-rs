@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::TempDir;
+use tokio::task::JoinHandle;
 
 /// Test repository setup that creates a bare remote and a local clone
 pub struct TestRepoSetup {
@@ -205,4 +206,14 @@ pub fn create_gitignore(repo_path: &Path, patterns: &[&str]) -> Result<()> {
     let content = patterns.join("\n");
     fs::write(repo_path.join(".gitignore"), content)?;
     Ok(())
+}
+
+#[allow(dead_code)]
+pub async fn abort_watch_task<T>(handle: JoinHandle<T>) {
+    handle.abort();
+    match handle.await {
+        Err(err) if err.is_cancelled() => {}
+        Err(err) => panic!("watch task failed to join cleanly: {err}"),
+        Ok(_) => panic!("watch task exited before cancellation"),
+    }
 }

@@ -1,7 +1,7 @@
 mod common;
 
 use anyhow::Result;
-use common::TestRepoSetup;
+use common::{abort_watch_task, TestRepoSetup};
 use git_sync_rs::{watch_with_periodic_sync, SyncConfig, WatchConfig};
 use std::fs;
 use std::path::Path;
@@ -66,8 +66,7 @@ async fn file_changes_trigger_sync() -> Result<()> {
     )
     .await?;
 
-    // Cancel the watch task
-    watch_handle.abort();
+    abort_watch_task(watch_handle).await;
 
     Ok(())
 }
