@@ -1,7 +1,7 @@
 mod common;
 
 use anyhow::Result;
-use common::TestRepoSetup;
+use common::{abort_watch_task, TestRepoSetup};
 use git_sync_rs::{watch_with_periodic_sync, SyncConfig, WatchConfig};
 use std::time::Duration;
 
@@ -65,7 +65,7 @@ async fn periodic_sync_works() -> Result<()> {
     // Verify the change was pulled
     setup.assert_file_content("remote_change.txt", "From remote\n")?;
 
-    watch_handle.abort();
+    abort_watch_task(watch_handle).await;
 
     Ok(())
 }
