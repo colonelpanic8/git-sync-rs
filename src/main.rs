@@ -93,6 +93,10 @@ enum Commands {
         #[arg(long)]
         no_initial_sync: bool,
 
+        /// Repository-relative path to watch (repeatable; defaults to the whole repository)
+        #[arg(long = "watch-path", value_name = "PATH")]
+        watch_paths: Vec<PathBuf>,
+
         /// Show system tray indicator (requires tray feature)
         #[cfg(feature = "tray")]
         #[arg(long)]
@@ -264,6 +268,7 @@ async fn run_for_single_repo(cli: &Cli, loader: &ConfigLoader, repo_path: PathBu
                 enable_tray,
                 tray_icon,
                 periodic_sync_interval_ms: None,
+                watch_paths: Vec::new(),
             };
 
             let interval_ms = resolve_watch_interval_ms(
@@ -294,6 +299,7 @@ async fn run_for_single_repo(cli: &Cli, loader: &ConfigLoader, repo_path: PathBu
             min_interval,
             interval,
             no_initial_sync,
+            watch_paths,
             #[cfg(feature = "tray")]
             tray,
             #[cfg(feature = "tray")]
@@ -322,6 +328,7 @@ async fn run_for_single_repo(cli: &Cli, loader: &ConfigLoader, repo_path: PathBu
                 enable_tray,
                 tray_icon,
                 periodic_sync_interval_ms: None,
+                watch_paths: watch_paths.clone(),
             };
 
             let interval_ms = resolve_watch_interval_ms(
@@ -404,6 +411,7 @@ async fn run_for_configured_repositories(cli: &Cli, loader: &ConfigLoader) -> Re
                 enable_tray,
                 tray_icon,
                 periodic_sync_interval_ms: None,
+                watch_paths: Vec::new(),
             };
 
             if cli.dry_run {
@@ -434,6 +442,7 @@ async fn run_for_configured_repositories(cli: &Cli, loader: &ConfigLoader) -> Re
             min_interval,
             interval,
             no_initial_sync,
+            watch_paths,
             #[cfg(feature = "tray")]
             tray,
             #[cfg(feature = "tray")]
@@ -459,6 +468,7 @@ async fn run_for_configured_repositories(cli: &Cli, loader: &ConfigLoader) -> Re
                 enable_tray,
                 tray_icon,
                 periodic_sync_interval_ms: None,
+                watch_paths: watch_paths.clone(),
             };
 
             if cli.dry_run {
@@ -704,6 +714,7 @@ mod tests {
             min_interval: 1.0,
             interval: None,
             no_initial_sync: false,
+            watch_paths: Vec::new(),
             tray: false,
             tray_icon: None,
         })
@@ -716,6 +727,7 @@ mod tests {
             min_interval: 1.0,
             interval: None,
             no_initial_sync: false,
+            watch_paths: Vec::new(),
         })
     }
 

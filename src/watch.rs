@@ -52,6 +52,13 @@ pub struct WatchConfig {
     /// Optional periodic sync interval in milliseconds.
     /// When set, sync attempts are triggered even without filesystem events.
     pub periodic_sync_interval_ms: Option<u64>,
+
+    /// Repository-relative paths to watch. An empty list watches the entire repository.
+    ///
+    /// Scoping watches is useful for repositories whose worktree contains large ignored
+    /// trees, since native recursive watchers may still allocate resources for ignored
+    /// files before event filtering occurs.
+    pub watch_paths: Vec<PathBuf>,
 }
 
 impl Default for WatchConfig {
@@ -64,6 +71,7 @@ impl Default for WatchConfig {
             enable_tray: false,
             tray_icon: None,
             periodic_sync_interval_ms: None,
+            watch_paths: Vec::new(),
         }
     }
 }
@@ -185,10 +193,60 @@ impl WatchManager {
         let mut watcher =
             RecommendedWatcher::new(move |res| handler.handle_event(res), Config::default())?;
 
-        // Watch the repository path
-        watcher.watch(Path::new(&self.repo_path), RecursiveMode::Recursive)?;
+        for watch_path in self.resolved_watch_paths()? {
+            let recursive_mode = if watch_path.is_dir() {
+                RecursiveMode::Recursive
+            } else {
+                RecursiveMode::NonRecursive
+            };
+            info!(path = %watch_path.display(), "Adding filesystem watch");
+            watcher.watch(&watch_path, recursive_mode)?;
+        }
 
         Ok(watcher)
+    }
+
+    fn resolved_watch_paths(&self) -> Result<Vec<PathBuf>> {
+        let repo_path = PathBuf::from(&self.repo_path);
+        if self.watch_config.watch_paths.is_empty() {
+            return Ok(vec![repo_path]);
+        }
+
+        let canonical_repo = repo_path.canonicalize().map_err(|error| {
+            SyncError::WatchError(format!(
+                "failed to resolve repository path {}: {error}",
+                repo_path.display()
+            ))
+        })?;
+        let mut resolved = Vec::with_capacity(self.watch_config.watch_paths.len());
+
+        for configured_path in &self.watch_config.watch_paths {
+            let candidate = if configured_path.is_absolute() {
+                configured_path.clone()
+            } else {
+                canonical_repo.join(configured_path)
+            };
+            let canonical_path = candidate.canonicalize().map_err(|error| {
+                SyncError::WatchError(format!(
+                    "failed to resolve watch path {}: {error}",
+                    candidate.display()
+                ))
+            })?;
+
+            if !canonical_path.starts_with(&canonical_repo) {
+                return Err(SyncError::WatchError(format!(
+                    "watch path {} is outside repository {}",
+                    canonical_path.display(),
+                    canonical_repo.display()
+                )));
+            }
+
+            if !resolved.contains(&canonical_path) {
+                resolved.push(canonical_path);
+            }
+        }
+
+        Ok(resolved)
     }
 
     /// Process file system events
@@ -1225,6 +1283,72 @@ mod scheduler_tests {
         scheduler.request_sync_now_at(base + Duration::from_millis(100));
         assert!(!scheduler.should_sync_at(base + Duration::from_millis(999)));
         assert!(scheduler.should_sync_at(base + Duration::from_millis(1000)));
+    }
+}
+
+#[cfg(test)]
+mod watch_path_tests {
+    use super::{WatchConfig, WatchManager};
+    use crate::sync::SyncConfig;
+    use std::fs;
+    use std::path::PathBuf;
+    use tempfile::tempdir;
+
+    #[test]
+    fn scoped_watch_paths_are_resolved_and_deduplicated() {
+        let repo = tempdir().expect("create repository directory");
+        fs::create_dir(repo.path().join("sessions")).expect("create watch directory");
+        fs::write(repo.path().join("history.jsonl"), "").expect("create watch file");
+
+        let manager = WatchManager::new(
+            repo.path(),
+            SyncConfig::default(),
+            WatchConfig {
+                watch_paths: vec![
+                    PathBuf::from("sessions"),
+                    PathBuf::from("history.jsonl"),
+                    PathBuf::from("sessions"),
+                ],
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            manager.resolved_watch_paths().expect("resolve watch paths"),
+            vec![
+                repo.path()
+                    .join("sessions")
+                    .canonicalize()
+                    .expect("canonical sessions path"),
+                repo.path()
+                    .join("history.jsonl")
+                    .canonicalize()
+                    .expect("canonical history path"),
+            ]
+        );
+    }
+
+    #[test]
+    fn scoped_watch_paths_must_remain_inside_repository() {
+        let parent = tempdir().expect("create parent directory");
+        let repo = parent.path().join("repo");
+        let outside = parent.path().join("outside");
+        fs::create_dir(&repo).expect("create repository directory");
+        fs::create_dir(&outside).expect("create outside directory");
+
+        let manager = WatchManager::new(
+            &repo,
+            SyncConfig::default(),
+            WatchConfig {
+                watch_paths: vec![outside],
+                ..Default::default()
+            },
+        );
+
+        let error = manager
+            .resolved_watch_paths()
+            .expect_err("outside path should be rejected");
+        assert!(error.to_string().contains("outside repository"));
     }
 }
 

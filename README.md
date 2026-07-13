@@ -90,6 +90,12 @@ git-sync-rs /path/to/repo watch --min-interval 3
 # With periodic sync every 5 minutes
 git-sync-rs /path/to/repo watch --interval 300
 
+# Watch only selected paths (repeat the option as needed)
+git-sync-rs /path/to/repo watch \
+  --watch-path sessions \
+  --watch-path archived_sessions \
+  --watch-path history.jsonl
+
 # Skip the initial sync at startup
 git-sync-rs /path/to/repo watch --no-initial-sync
 
@@ -151,6 +157,7 @@ When no repository path is passed:
 - `watch --min-interval <seconds>` - Minimum time between sync attempts (default `1`)
 - `watch --interval <seconds>` - Periodic sync interval
 - `watch --no-initial-sync` - Do not sync immediately on startup
+- `watch --watch-path <path>` - Watch only this repository-relative path (repeatable)
 - `sync --check-only` - Run repository checks without mutating state
 - `init [--force]` - Create example config file
 - `version` - Print semantic version and git commit hash
