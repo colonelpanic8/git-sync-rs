@@ -164,12 +164,6 @@ impl WatchManager {
     pub async fn watch(&self) -> Result<()> {
         info!("Starting watch mode for: {}", self.repo_path);
 
-        // Sync on startup if configured
-        if self.watch_config.sync_on_start {
-            info!("Performing initial sync");
-            self.perform_sync().await?;
-        }
-
         // Create channel for file events
         let (tx, rx) = mpsc::channel::<Event>(100);
 
@@ -277,6 +271,17 @@ impl WatchManager {
                 });
         if let Some(interval) = periodic_interval.as_mut() {
             interval.tick().await; // Skip first immediate tick
+        }
+
+        if self.watch_config.sync_on_start {
+            info!("Performing initial sync");
+            match self.perform_sync().await {
+                Ok(()) => sync_state.on_sync_success(),
+                Err(error) => {
+                    sync_state.on_sync_failure(&error);
+                    self.log_sync_error(&error);
+                }
+            }
         }
 
         #[cfg(feature = "tray")]

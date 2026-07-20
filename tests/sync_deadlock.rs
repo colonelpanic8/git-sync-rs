@@ -7,6 +7,52 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
+use tokio::time::timeout;
+
+#[tokio::test]
+async fn retryable_initial_sync_error_keeps_watch_running() -> Result<()> {
+    let setup = TestRepoSetup::new()?;
+    setup.commit_file("README.md", "# Initial\n", "Initial commit")?;
+    setup.push()?;
+
+    let status = Command::new("git")
+        .current_dir(&setup.local_path)
+        .args(["checkout", "--detach", "HEAD"])
+        .status()?;
+    assert!(status.success(), "Failed to detach HEAD");
+
+    let sync_config = SyncConfig {
+        sync_new_files: true,
+        skip_hooks: false,
+        commit_message: Some("Auto-sync: {hostname} at {timestamp}".to_string()),
+        remote_name: "origin".to_string(),
+        branch_name: "master".to_string(),
+        conflict_branch: false,
+        target_branch: None,
+    };
+    let watch_config = WatchConfig {
+        debounce_ms: 100,
+        min_interval_ms: 200,
+        sync_on_start: true,
+        dry_run: false,
+        ..Default::default()
+    };
+
+    let local_path = setup.local_path.clone();
+    let mut watch_handle = tokio::spawn(async move {
+        watch_with_periodic_sync(&local_path, sync_config, watch_config, None).await
+    });
+
+    assert!(
+        timeout(Duration::from_secs(1), &mut watch_handle)
+            .await
+            .is_err(),
+        "watch mode exited after a retryable initial sync failure"
+    );
+
+    abort_watch_task(watch_handle).await;
+    Ok(())
+}
 
 #[tokio::test]
 async fn sync_stuck_after_error_during_watch() -> Result<()> {
