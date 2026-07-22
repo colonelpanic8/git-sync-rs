@@ -4,7 +4,7 @@ use std::path::Path;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{info, warn};
 
-use super::state::{TrayCommand, TrayState, TrayStatus};
+use super::state::{AggregateTrayState, TrayCommand, TrayState, TrayStatus};
 
 const ICON_32_PNG: &[u8] = include_bytes!("../../assets/git-icon-32.png");
 const ICON_48_PNG: &[u8] = include_bytes!("../../assets/git-icon-48.png");
@@ -72,7 +72,7 @@ enum IconSource {
 
 #[derive(Debug)]
 pub struct GitSyncTray {
-    pub state: TrayState,
+    pub state: AggregateTrayState,
     pub cmd_tx: UnboundedSender<TrayCommand>,
     /// How the base icon is provided to the tray.
     icon_source: IconSource,
@@ -99,6 +99,14 @@ impl GitSyncTray {
         cmd_tx: UnboundedSender<TrayCommand>,
         custom_icon: Option<String>,
     ) -> Self {
+        Self::new_aggregate(AggregateTrayState::single(state), cmd_tx, custom_icon)
+    }
+
+    pub fn new_aggregate(
+        state: AggregateTrayState,
+        cmd_tx: UnboundedSender<TrayCommand>,
+        custom_icon: Option<String>,
+    ) -> Self {
         let icon_source = match custom_icon {
             Some(value) => {
                 let path = Path::new(&value);
@@ -121,7 +129,6 @@ impl GitSyncTray {
             }
             None => IconSource::Bundled,
         };
-
         let icons = match &icon_source {
             IconSource::Bundled => load_icon_set(ICON_32_PNG, ICON_48_PNG, ICON_64_PNG),
             _ => Vec::new(),
@@ -149,14 +156,13 @@ impl GitSyncTray {
     }
 
     fn overlay_pixmaps_for_status(&self) -> Vec<ksni::Icon> {
-        let base = if self.state.paused {
-            &self.overlays.pause
-        } else {
-            match &self.state.status {
-                TrayStatus::Idle => return self.generation_only_pixmap(),
-                TrayStatus::Syncing => &self.overlays.sync,
-                TrayStatus::Error(_) => &self.overlays.error,
+        let base = match self.state.aggregate_status() {
+            TrayStatus::Error(_) => &self.overlays.error,
+            TrayStatus::Syncing => &self.overlays.sync,
+            TrayStatus::Starting | TrayStatus::Idle if self.state.any_paused() => {
+                &self.overlays.pause
             }
+            TrayStatus::Starting | TrayStatus::Idle => return self.generation_only_pixmap(),
         };
         let mut icons = base.clone();
         // Append a tiny unique pixmap so ksni's property-change detector
@@ -217,17 +223,13 @@ impl ksni::Tray for GitSyncTray {
     }
 
     fn title(&self) -> String {
-        format!("git-sync-rs - {}", self.state.repo_name())
+        "git-sync-rs".into()
     }
 
     fn tool_tip(&self) -> ksni::ToolTip {
         ksni::ToolTip {
-            title: format!("git-sync-rs - {}", self.state.repo_name()),
-            description: format!(
-                "{}\n{}",
-                self.state.status_text(),
-                self.state.last_sync_text()
-            ),
+            title: "git-sync-rs".into(),
+            description: self.state.status_summary(),
             ..Default::default()
         }
     }
@@ -235,63 +237,136 @@ impl ksni::Tray for GitSyncTray {
     fn menu(&self) -> Vec<MenuItem<Self>> {
         let mut items = vec![
             StandardItem {
-                label: format!("git-sync-rs - {}", self.state.repo_name()),
+                label: "git-sync-rs".into(),
                 enabled: false,
                 ..Default::default()
             }
             .into(),
             MenuItem::Separator,
             StandardItem {
-                label: format!("Status: {}", self.state.status_text()),
+                label: self.state.status_summary(),
                 enabled: false,
-                ..Default::default()
-            }
-            .into(),
-            StandardItem {
-                label: self.state.last_sync_text(),
-                enabled: false,
-                ..Default::default()
-            }
-            .into(),
-            MenuItem::Separator,
-            StandardItem {
-                label: "Sync Now".into(),
-                icon_name: "view-refresh".into(),
-                enabled: !self.state.paused,
-                activate: Box::new(|this: &mut Self| {
-                    let _ = this.cmd_tx.send(TrayCommand::SyncNow);
-                }),
                 ..Default::default()
             }
             .into(),
         ];
 
-        if self.state.paused {
-            items.push(
+        for repo in self.state.repositories.values() {
+            let sync_path = repo.repo_path.clone();
+            let pause_path = repo.repo_path.clone();
+            let mut submenu = vec![
                 StandardItem {
-                    label: "Resume".into(),
-                    icon_name: "media-playback-start".into(),
-                    activate: Box::new(|this: &mut Self| {
-                        let _ = this.cmd_tx.send(TrayCommand::Resume);
+                    label: format!("Status: {}", repo.status_text()),
+                    enabled: false,
+                    ..Default::default()
+                }
+                .into(),
+                StandardItem {
+                    label: repo.last_sync_text(),
+                    enabled: false,
+                    ..Default::default()
+                }
+                .into(),
+            ];
+            if let Some(error) = &repo.last_error {
+                submenu.push(
+                    StandardItem {
+                        label: format!("Error: {error}"),
+                        enabled: false,
+                        ..Default::default()
+                    }
+                    .into(),
+                );
+            }
+            submenu.push(MenuItem::Separator);
+            submenu.push(
+                StandardItem {
+                    label: "Sync Now".into(),
+                    icon_name: "view-refresh".into(),
+                    enabled: !repo.paused,
+                    activate: Box::new(move |this: &mut Self| {
+                        let _ = this
+                            .cmd_tx
+                            .send(TrayCommand::SyncRepository(sync_path.clone()));
                     }),
                     ..Default::default()
                 }
                 .into(),
             );
-        } else {
-            items.push(
+            let paused = repo.paused;
+            submenu.push(
                 StandardItem {
-                    label: "Suspend".into(),
-                    icon_name: "media-playback-pause".into(),
-                    activate: Box::new(|this: &mut Self| {
-                        let _ = this.cmd_tx.send(TrayCommand::Suspend);
+                    label: if paused { "Resume" } else { "Suspend" }.into(),
+                    icon_name: if paused {
+                        "media-playback-start"
+                    } else {
+                        "media-playback-pause"
+                    }
+                    .into(),
+                    activate: Box::new(move |this: &mut Self| {
+                        let command = if paused {
+                            TrayCommand::ResumeRepository(pause_path.clone())
+                        } else {
+                            TrayCommand::SuspendRepository(pause_path.clone())
+                        };
+                        let _ = this.cmd_tx.send(command);
                     }),
+                    ..Default::default()
+                }
+                .into(),
+            );
+            items.push(
+                SubMenu {
+                    label: format!("{} — {}", repo.repo_name(), repo.status_text()),
+                    icon_name: match repo.status {
+                        TrayStatus::Error(_) => "dialog-error",
+                        TrayStatus::Syncing => "view-refresh",
+                        TrayStatus::Starting => "content-loading",
+                        TrayStatus::Idle if repo.paused => "media-playback-pause",
+                        TrayStatus::Idle => "emblem-default",
+                    }
+                    .into(),
+                    submenu,
                     ..Default::default()
                 }
                 .into(),
             );
         }
 
+        items.push(MenuItem::Separator);
+        items.push(
+            StandardItem {
+                label: "Sync All".into(),
+                icon_name: "view-refresh".into(),
+                activate: Box::new(|this: &mut Self| {
+                    let _ = this.cmd_tx.send(TrayCommand::SyncAll);
+                }),
+                ..Default::default()
+            }
+            .into(),
+        );
+        items.push(
+            StandardItem {
+                label: "Suspend All".into(),
+                icon_name: "media-playback-pause".into(),
+                activate: Box::new(|this: &mut Self| {
+                    let _ = this.cmd_tx.send(TrayCommand::SuspendAll);
+                }),
+                ..Default::default()
+            }
+            .into(),
+        );
+        items.push(
+            StandardItem {
+                label: "Resume All".into(),
+                icon_name: "media-playback-start".into(),
+                activate: Box::new(|this: &mut Self| {
+                    let _ = this.cmd_tx.send(TrayCommand::ResumeAll);
+                }),
+                ..Default::default()
+            }
+            .into(),
+        );
         items.push(MenuItem::Separator);
         items.push(
             StandardItem {

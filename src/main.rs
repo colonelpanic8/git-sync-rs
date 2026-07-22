@@ -1,13 +1,20 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+#[cfg(feature = "tray")]
+use git_sync_rs::runtime_state::SuspensionStore;
+#[cfg(feature = "tray")]
+use git_sync_rs::watch::run_aggregate_tray;
 use git_sync_rs::{
-    watch_with_periodic_sync, Config, ConfigLoader, RepositorySynchronizer, SyncConfig, SyncError,
-    WatchConfig,
+    watch_with_periodic_sync, Config, ConfigLoader, DefaultConfig, RepositoryConfig,
+    RepositorySynchronizer, SyncConfig, SyncError, WatchConfig, WatchManager,
 };
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process;
 use tokio::task::JoinSet;
+use tokio::time;
+#[cfg(feature = "tray")]
+use tracing::warn;
 use tracing::{error, info};
 
 const CLI_VERSION: &str = concat!(
@@ -78,12 +85,12 @@ enum Commands {
     /// Start watching mode with automatic sync (default)
     Watch {
         /// Debounce period in seconds (can use decimals like 0.5)
-        #[arg(long, default_value = "0.5")]
-        debounce: f64,
+        #[arg(long)]
+        debounce: Option<f64>,
 
         /// Minimum interval between syncs in seconds
-        #[arg(long, default_value = "1")]
-        min_interval: f64,
+        #[arg(long)]
+        min_interval: Option<f64>,
 
         /// Periodic sync interval in seconds (optional)
         #[arg(long)]
@@ -231,9 +238,49 @@ fn resolve_watch_interval_ms(
         .map(|secs| secs * 1000)
 }
 
+fn resolve_repo_watch_config(
+    mut watch_config: WatchConfig,
+    defaults: &DefaultConfig,
+    repo: &RepositoryConfig,
+    cli_debounce: Option<f64>,
+    cli_min_interval: Option<f64>,
+    cli_no_initial_sync: bool,
+    cli_watch_paths: &[PathBuf],
+) -> WatchConfig {
+    watch_config.debounce_ms =
+        (cli_debounce.or(repo.debounce).unwrap_or(defaults.debounce) * 1000.0) as u64;
+    watch_config.min_interval_ms = (cli_min_interval
+        .or(repo.min_interval)
+        .unwrap_or(defaults.min_interval)
+        * 1000.0) as u64;
+    watch_config.sync_on_start = if cli_no_initial_sync {
+        false
+    } else {
+        repo.initial_sync.unwrap_or(defaults.initial_sync)
+    };
+    watch_config.watch_paths = if cli_watch_paths.is_empty() {
+        repo.watch_paths.clone()
+    } else {
+        cli_watch_paths.to_vec()
+    };
+    watch_config
+}
+
+struct MultiRepoWatchOptions {
+    cli_new_files: Option<bool>,
+    cli_remote: Option<String>,
+    watch_config: WatchConfig,
+    cli_interval_secs: Option<u64>,
+    cli_debounce: Option<f64>,
+    cli_min_interval: Option<f64>,
+    cli_no_initial_sync: bool,
+    cli_watch_paths: Vec<PathBuf>,
+}
+
 async fn run_for_single_repo(cli: &Cli, loader: &ConfigLoader, repo_path: PathBuf) -> Result<()> {
     // Ensure the repository exists (clone if needed)
-    ensure_repository_exists(&repo_path)?;
+    let repo_config = loader.load_for_repo(&repo_path)?;
+    ensure_repository_exists(&repo_path, repo_config.uri.as_deref())?;
 
     // Log which repository we're working with
     info!("Working with repository: {}", repo_path.display());
@@ -260,16 +307,20 @@ async fn run_for_single_repo(cli: &Cli, loader: &ConfigLoader, repo_path: PathBu
 
             let tray_icon = env::var("GIT_SYNC_TRAY_ICON").ok();
 
-            let watch_config = WatchConfig {
-                debounce_ms: 500,
-                min_interval_ms: 1000,
-                sync_on_start: true,
-                dry_run: cli.dry_run,
-                enable_tray,
-                tray_icon,
-                periodic_sync_interval_ms: None,
-                watch_paths: Vec::new(),
-            };
+            let watch_config = resolve_repo_watch_config(
+                WatchConfig {
+                    dry_run: cli.dry_run,
+                    enable_tray,
+                    tray_icon,
+                    ..WatchConfig::default()
+                },
+                &config.defaults,
+                &repo_config,
+                None,
+                None,
+                false,
+                &[],
+            );
 
             let interval_ms = resolve_watch_interval_ms(
                 None,
@@ -320,16 +371,20 @@ async fn run_for_single_repo(cli: &Cli, loader: &ConfigLoader, repo_path: PathBu
             #[cfg(not(feature = "tray"))]
             let tray_icon: Option<String> = None;
 
-            let watch_config = WatchConfig {
-                debounce_ms: (debounce * 1000.0) as u64,
-                min_interval_ms: (min_interval * 1000.0) as u64,
-                sync_on_start: !no_initial_sync,
-                dry_run: cli.dry_run,
-                enable_tray,
-                tray_icon,
-                periodic_sync_interval_ms: None,
-                watch_paths: watch_paths.clone(),
-            };
+            let watch_config = resolve_repo_watch_config(
+                WatchConfig {
+                    dry_run: cli.dry_run,
+                    enable_tray,
+                    tray_icon,
+                    ..WatchConfig::default()
+                },
+                &config.defaults,
+                &repo_config,
+                *debounce,
+                *min_interval,
+                *no_initial_sync,
+                watch_paths,
+            );
 
             let interval_ms = resolve_watch_interval_ms(
                 *interval,
@@ -368,16 +423,14 @@ async fn run_for_configured_repositories(cli: &Cli, loader: &ConfigLoader) -> Re
         repo_paths.len()
     );
 
-    for repo_path in &repo_paths {
-        ensure_repository_exists(repo_path)?;
-    }
-
     match &cli.command {
         Some(Commands::Check) => {
             for repo_path in &repo_paths {
                 info!("Working with repository: {}", repo_path.display());
                 let sync_config =
                     loader.to_sync_config(repo_path, cli.new_files, cli.remote.clone())?;
+                let repo_config = loader.load_for_repo(repo_path)?;
+                ensure_repository_exists(repo_path, repo_config.uri.as_deref())?;
                 run_check(repo_path, sync_config).await?;
             }
             Ok(())
@@ -387,6 +440,8 @@ async fn run_for_configured_repositories(cli: &Cli, loader: &ConfigLoader) -> Re
                 info!("Working with repository: {}", repo_path.display());
                 let sync_config =
                     loader.to_sync_config(repo_path, cli.new_files, cli.remote.clone())?;
+                let repo_config = loader.load_for_repo(repo_path)?;
+                ensure_repository_exists(repo_path, repo_config.uri.as_deref())?;
                 if *check_only {
                     run_check(repo_path, sync_config).await?;
                 } else {
@@ -404,14 +459,10 @@ async fn run_for_configured_repositories(cli: &Cli, loader: &ConfigLoader) -> Re
             let tray_icon = env::var("GIT_SYNC_TRAY_ICON").ok();
 
             let watch_config = WatchConfig {
-                debounce_ms: 500,
-                min_interval_ms: 1000,
-                sync_on_start: true,
                 dry_run: cli.dry_run,
                 enable_tray,
                 tray_icon,
-                periodic_sync_interval_ms: None,
-                watch_paths: Vec::new(),
+                ..WatchConfig::default()
             };
 
             if cli.dry_run {
@@ -429,11 +480,16 @@ async fn run_for_configured_repositories(cli: &Cli, loader: &ConfigLoader) -> Re
             run_multi_repo_watch(
                 repo_paths,
                 loader,
-                cli.new_files,
-                cli.remote.clone(),
-                watch_config,
-                None,
-                config.defaults.sync_interval,
+                MultiRepoWatchOptions {
+                    cli_new_files: cli.new_files,
+                    cli_remote: cli.remote.clone(),
+                    watch_config,
+                    cli_interval_secs: None,
+                    cli_debounce: None,
+                    cli_min_interval: None,
+                    cli_no_initial_sync: false,
+                    cli_watch_paths: Vec::new(),
+                },
             )
             .await
         }
@@ -461,14 +517,10 @@ async fn run_for_configured_repositories(cli: &Cli, loader: &ConfigLoader) -> Re
             let tray_icon: Option<String> = None;
 
             let watch_config = WatchConfig {
-                debounce_ms: (debounce * 1000.0) as u64,
-                min_interval_ms: (min_interval * 1000.0) as u64,
-                sync_on_start: !no_initial_sync,
                 dry_run: cli.dry_run,
                 enable_tray,
                 tray_icon,
-                periodic_sync_interval_ms: None,
-                watch_paths: watch_paths.clone(),
+                ..WatchConfig::default()
             };
 
             if cli.dry_run {
@@ -486,11 +538,16 @@ async fn run_for_configured_repositories(cli: &Cli, loader: &ConfigLoader) -> Re
             run_multi_repo_watch(
                 repo_paths,
                 loader,
-                cli.new_files,
-                cli.remote.clone(),
-                watch_config,
-                *interval,
-                config.defaults.sync_interval,
+                MultiRepoWatchOptions {
+                    cli_new_files: cli.new_files,
+                    cli_remote: cli.remote.clone(),
+                    watch_config,
+                    cli_interval_secs: *interval,
+                    cli_debounce: *debounce,
+                    cli_min_interval: *min_interval,
+                    cli_no_initial_sync: *no_initial_sync,
+                    cli_watch_paths: watch_paths.clone(),
+                },
             )
             .await
         }
@@ -501,29 +558,119 @@ async fn run_for_configured_repositories(cli: &Cli, loader: &ConfigLoader) -> Re
 async fn run_multi_repo_watch(
     repo_paths: Vec<PathBuf>,
     loader: &ConfigLoader,
-    cli_new_files: Option<bool>,
-    cli_remote: Option<String>,
-    watch_config: WatchConfig,
-    cli_interval_secs: Option<u64>,
-    default_interval_secs: u64,
+    options: MultiRepoWatchOptions,
 ) -> Result<()> {
     let mut join_set = JoinSet::new();
+    let defaults = loader.load()?.defaults;
+    #[cfg(feature = "tray")]
+    let aggregate_tray_enabled = options.watch_config.enable_tray;
+    #[cfg(feature = "tray")]
+    let mut controls = Vec::new();
+    #[cfg(feature = "tray")]
+    let suspension_store = if aggregate_tray_enabled {
+        match SuspensionStore::load_default() {
+            Ok(store) => {
+                info!(path = %store.path().display(), "Loaded persistent suspension state");
+                Some(store)
+            }
+            Err(error) => {
+                warn!(%error, "Unable to load persistent suspension state; continuing with in-memory state");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     for repo_path in repo_paths {
         info!("Watching repository: {}", repo_path.display());
-        let sync_config = loader.to_sync_config(&repo_path, cli_new_files, cli_remote.clone())?;
+        let sync_config = loader.to_sync_config(
+            &repo_path,
+            options.cli_new_files,
+            options.cli_remote.clone(),
+        )?;
         let repo_config = loader.load_for_repo(&repo_path)?;
         let interval_ms = resolve_watch_interval_ms(
-            cli_interval_secs,
+            options.cli_interval_secs,
             repo_config.interval,
-            default_interval_secs,
+            defaults.sync_interval,
         );
-        let repo_watch_config = watch_config.clone();
+        let repo_watch_config = resolve_repo_watch_config(
+            options.watch_config.clone(),
+            &defaults,
+            &repo_config,
+            options.cli_debounce,
+            options.cli_min_interval,
+            options.cli_no_initial_sync,
+            &options.cli_watch_paths,
+        );
 
+        #[cfg(feature = "tray")]
+        if aggregate_tray_enabled {
+            let mut controlled_watch_config = repo_watch_config;
+            controlled_watch_config.enable_tray = false;
+            controlled_watch_config.periodic_sync_interval_ms = interval_ms;
+            let manager = WatchManager::new(&repo_path, sync_config, controlled_watch_config);
+            let manager = if let Some(store) = suspension_store.clone() {
+                manager.with_suspension_store(store)
+            } else {
+                manager
+            };
+            let control = manager.control_named(repo_config.name.clone());
+            controls.push(control.clone());
+            let repo_uri = repo_config.uri.clone();
+            join_set.spawn(async move {
+                loop {
+                    if control.is_shutdown_requested() {
+                        return Ok(());
+                    }
+                    if let Err(error) = ensure_repository_exists(&repo_path, repo_uri.as_deref()) {
+                        control.set_watch_error(error.to_string()).await;
+                        time::sleep(std::time::Duration::from_secs(5)).await;
+                        continue;
+                    }
+                    match manager.watch().await {
+                        Ok(()) => return Ok(()),
+                        Err(error) => {
+                            control.set_watch_error(error.to_string()).await;
+                            error!(repo = %repo_path.display(), %error, "Repository watcher failed; retrying");
+                            time::sleep(std::time::Duration::from_secs(5)).await;
+                        }
+                    }
+                }
+            });
+            continue;
+        }
+
+        let repo_uri = repo_config.uri.clone();
+        let mut supervised_watch_config = repo_watch_config;
+        supervised_watch_config.periodic_sync_interval_ms = interval_ms;
+        let manager = WatchManager::new(&repo_path, sync_config, supervised_watch_config);
         join_set.spawn(async move {
-            watch_with_periodic_sync(&repo_path, sync_config, repo_watch_config, interval_ms)
+            loop {
+                if let Err(error) = ensure_repository_exists(&repo_path, repo_uri.as_deref()) {
+                    error!(repo = %repo_path.display(), %error, "Repository unavailable; retrying");
+                    time::sleep(std::time::Duration::from_secs(5)).await;
+                    continue;
+                }
+                match manager.watch().await {
+                    Ok(()) => return Ok(()),
+                    Err(error) => {
+                        error!(repo = %repo_path.display(), %error, "Repository watcher failed; retrying");
+                        time::sleep(std::time::Duration::from_secs(5)).await;
+                    }
+                }
+            }
+        });
+    }
+
+    #[cfg(feature = "tray")]
+    if aggregate_tray_enabled {
+        let tray_icon = options.watch_config.tray_icon.clone();
+        join_set.spawn(async move {
+            run_aggregate_tray(controls, tray_icon)
                 .await
-                .map_err(|e| anyhow::anyhow!(e))
+                .map_err(anyhow::Error::from)
         });
     }
 
@@ -627,7 +774,7 @@ fn init_config(force: bool) -> Result<()> {
 }
 
 /// Clone repository if it doesn't exist and GIT_SYNC_REPOSITORY is set
-fn ensure_repository_exists(repo_path: &Path) -> Result<()> {
+fn ensure_repository_exists(repo_path: &Path, configured_uri: Option<&str>) -> Result<()> {
     // Check if the directory exists
     if repo_path.exists() {
         // Directory exists, check if it's a git repo
@@ -642,11 +789,14 @@ fn ensure_repository_exists(repo_path: &Path) -> Result<()> {
     }
 
     // Directory doesn't exist, check for GIT_SYNC_REPOSITORY
-    let repo_url = match env::var("GIT_SYNC_REPOSITORY") {
-        Ok(url) => url,
-        Err(_) => {
+    let repo_url = match configured_uri
+        .map(str::to_owned)
+        .or_else(|| env::var("GIT_SYNC_REPOSITORY").ok())
+    {
+        Some(url) => url,
+        None => {
             return Err(anyhow::anyhow!(
-                "Directory {:?} does not exist. Set GIT_SYNC_REPOSITORY to clone a repository.",
+                "Directory {:?} does not exist. Configure its uri or set GIT_SYNC_REPOSITORY to clone it.",
                 repo_path
             ));
         }
@@ -710,8 +860,8 @@ mod tests {
     #[cfg(feature = "tray")]
     fn watch_command() -> Option<Commands> {
         Some(Commands::Watch {
-            debounce: 0.5,
-            min_interval: 1.0,
+            debounce: Some(0.5),
+            min_interval: Some(1.0),
             interval: None,
             no_initial_sync: false,
             watch_paths: Vec::new(),
@@ -723,8 +873,8 @@ mod tests {
     #[cfg(not(feature = "tray"))]
     fn watch_command() -> Option<Commands> {
         Some(Commands::Watch {
-            debounce: 0.5,
-            min_interval: 1.0,
+            debounce: Some(0.5),
+            min_interval: Some(1.0),
             interval: None,
             no_initial_sync: false,
             watch_paths: Vec::new(),
@@ -738,32 +888,17 @@ mod tests {
         }
     }
 
+    fn repo(path: &str, watch: bool) -> RepositoryConfig {
+        RepositoryConfig {
+            path: PathBuf::from(path),
+            watch,
+            ..RepositoryConfig::default()
+        }
+    }
+
     #[test]
     fn watch_selects_only_watch_enabled_repositories_when_any_are_marked() {
-        let config = config_with_repos(vec![
-            RepositoryConfig {
-                path: PathBuf::from("/tmp/repo-a"),
-                sync_new_files: None,
-                skip_hooks: None,
-                commit_message: None,
-                remote: None,
-                branch: None,
-                watch: true,
-                interval: None,
-                conflict_branch: None,
-            },
-            RepositoryConfig {
-                path: PathBuf::from("/tmp/repo-b"),
-                sync_new_files: None,
-                skip_hooks: None,
-                commit_message: None,
-                remote: None,
-                branch: None,
-                watch: false,
-                interval: None,
-                conflict_branch: None,
-            },
-        ]);
+        let config = config_with_repos(vec![repo("/tmp/repo-a", true), repo("/tmp/repo-b", false)]);
 
         let selected = configured_repositories_for_command(&config, &watch_command());
         assert_eq!(selected, vec![PathBuf::from("/tmp/repo-a")]);
@@ -771,30 +906,7 @@ mod tests {
 
     #[test]
     fn default_command_uses_same_watch_repository_selection() {
-        let config = config_with_repos(vec![
-            RepositoryConfig {
-                path: PathBuf::from("/tmp/repo-a"),
-                sync_new_files: None,
-                skip_hooks: None,
-                commit_message: None,
-                remote: None,
-                branch: None,
-                watch: true,
-                interval: None,
-                conflict_branch: None,
-            },
-            RepositoryConfig {
-                path: PathBuf::from("/tmp/repo-b"),
-                sync_new_files: None,
-                skip_hooks: None,
-                commit_message: None,
-                remote: None,
-                branch: None,
-                watch: false,
-                interval: None,
-                conflict_branch: None,
-            },
-        ]);
+        let config = config_with_repos(vec![repo("/tmp/repo-a", true), repo("/tmp/repo-b", false)]);
 
         let selected = configured_repositories_for_command(&config, &None);
         assert_eq!(selected, vec![PathBuf::from("/tmp/repo-a")]);
@@ -802,30 +914,8 @@ mod tests {
 
     #[test]
     fn watch_selects_all_repositories_when_none_are_marked() {
-        let config = config_with_repos(vec![
-            RepositoryConfig {
-                path: PathBuf::from("/tmp/repo-a"),
-                sync_new_files: None,
-                skip_hooks: None,
-                commit_message: None,
-                remote: None,
-                branch: None,
-                watch: false,
-                interval: None,
-                conflict_branch: None,
-            },
-            RepositoryConfig {
-                path: PathBuf::from("/tmp/repo-b"),
-                sync_new_files: None,
-                skip_hooks: None,
-                commit_message: None,
-                remote: None,
-                branch: None,
-                watch: false,
-                interval: None,
-                conflict_branch: None,
-            },
-        ]);
+        let config =
+            config_with_repos(vec![repo("/tmp/repo-a", false), repo("/tmp/repo-b", false)]);
 
         let selected = configured_repositories_for_command(&config, &watch_command());
         assert_eq!(
@@ -836,30 +926,7 @@ mod tests {
 
     #[test]
     fn check_selects_all_configured_repositories() {
-        let config = config_with_repos(vec![
-            RepositoryConfig {
-                path: PathBuf::from("/tmp/repo-a"),
-                sync_new_files: None,
-                skip_hooks: None,
-                commit_message: None,
-                remote: None,
-                branch: None,
-                watch: true,
-                interval: None,
-                conflict_branch: None,
-            },
-            RepositoryConfig {
-                path: PathBuf::from("/tmp/repo-b"),
-                sync_new_files: None,
-                skip_hooks: None,
-                commit_message: None,
-                remote: None,
-                branch: None,
-                watch: false,
-                interval: None,
-                conflict_branch: None,
-            },
-        ]);
+        let config = config_with_repos(vec![repo("/tmp/repo-a", true), repo("/tmp/repo-b", false)]);
 
         let selected = configured_repositories_for_command(&config, &Some(Commands::Check));
         assert_eq!(
@@ -873,5 +940,32 @@ mod tests {
         assert_eq!(resolve_watch_interval_ms(Some(5), Some(10), 20), Some(5000));
         assert_eq!(resolve_watch_interval_ms(None, Some(10), 20), Some(10000));
         assert_eq!(resolve_watch_interval_ms(None, None, 20), Some(20000));
+    }
+
+    #[test]
+    fn repository_watch_settings_override_defaults_and_cli_wins() {
+        let defaults = DefaultConfig::default();
+        let repository = RepositoryConfig {
+            path: PathBuf::from("/tmp/repo"),
+            debounce: Some(2.0),
+            min_interval: Some(30.0),
+            initial_sync: Some(false),
+            watch_paths: vec![PathBuf::from("history")],
+            ..RepositoryConfig::default()
+        };
+
+        let resolved = resolve_repo_watch_config(
+            WatchConfig::default(),
+            &defaults,
+            &repository,
+            None,
+            Some(5.0),
+            false,
+            &[],
+        );
+        assert_eq!(resolved.debounce_ms, 2000);
+        assert_eq!(resolved.min_interval_ms, 5000);
+        assert!(!resolved.sync_on_start);
+        assert_eq!(resolved.watch_paths, vec![PathBuf::from("history")]);
     }
 }

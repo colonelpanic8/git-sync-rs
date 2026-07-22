@@ -2,9 +2,11 @@ mod event_filter;
 
 use self::event_filter::EventFilter;
 use crate::error::{Result, SyncError};
+#[cfg(feature = "tray")]
+use crate::runtime_state::SuspensionStore;
 use crate::sync::{RepositorySynchronizer, SyncConfig};
 #[cfg(feature = "tray")]
-use crate::tray::{GitSyncTray, TrayCommand, TrayState, TrayStatus};
+use crate::tray::{AggregateTrayState, GitSyncTray, TrayCommand, TrayState, TrayStatus};
 #[cfg(feature = "tray")]
 use ksni::TrayMethods;
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
@@ -27,6 +29,125 @@ use tracing::{debug, error, info, warn};
 const TRAY_RETRY_FALLBACK_DELAY: Duration = Duration::from_secs(15);
 #[cfg(feature = "tray")]
 const TRAY_RETRY_SOON_DELAY: Duration = Duration::from_secs(1);
+
+#[cfg(feature = "tray")]
+pub async fn run_aggregate_tray(
+    controls: Vec<WatchControl>,
+    tray_icon: Option<String>,
+) -> Result<()> {
+    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut tray_handle: Option<ksni::Handle<GitSyncTray>> = None;
+    let mut spawn_task: Option<
+        tokio::task::JoinHandle<std::result::Result<ksni::Handle<GitSyncTray>, ksni::Error>>,
+    > = None;
+    let mut next_attempt = time::Instant::now();
+    let mut refresh = time::interval(Duration::from_millis(500));
+    let mut last_render_signature: Option<String> = None;
+
+    loop {
+        tokio::select! {
+            _ = refresh.tick() => {
+                if let Some(task) = spawn_task.as_ref() {
+                    if task.is_finished() {
+                        match spawn_task.take().expect("checked Some").await {
+                            Ok(Ok(handle)) => {
+                                info!("Aggregate system tray indicator started");
+                                tray_handle = Some(handle);
+                            }
+                            Ok(Err(error)) => {
+                                warn!(%error, "Aggregate tray unavailable; will retry");
+                                next_attempt = time::Instant::now() + TRAY_RETRY_FALLBACK_DELAY;
+                            }
+                            Err(error) => {
+                                warn!(%error, "Aggregate tray spawn task failed; will retry");
+                                next_attempt = time::Instant::now() + TRAY_RETRY_FALLBACK_DELAY;
+                            }
+                        }
+                    }
+                }
+
+                let mut state = AggregateTrayState::default();
+                for control in &controls {
+                    state.update_repository(control.snapshot().await);
+                }
+                let render_signature = state.render_signature();
+
+                if let Some(handle) = tray_handle.as_ref() {
+                    if last_render_signature.as_ref() != Some(&render_signature) {
+                        let update_state = state.clone();
+                        if handle.update(move |tray| {
+                            tray.state = update_state;
+                            tray.bump_icon_generation();
+                        }).await.is_none() {
+                            tray_handle = None;
+                            last_render_signature = None;
+                            next_attempt = time::Instant::now() + TRAY_RETRY_SOON_DELAY;
+                        } else {
+                            last_render_signature = Some(render_signature);
+                        }
+                    }
+                } else if spawn_task.is_none() && time::Instant::now() >= next_attempt {
+                    let tx = cmd_tx.clone();
+                    let icon = tray_icon.clone();
+                    spawn_task = Some(tokio::spawn(async move {
+                        GitSyncTray::new_aggregate(state, tx, icon)
+                            .assume_sni_available(true)
+                            .spawn()
+                            .await
+                    }));
+                    last_render_signature = Some(render_signature);
+                }
+            }
+            Some(command) = cmd_rx.recv() => {
+                match command {
+                    TrayCommand::SyncNow | TrayCommand::SyncAll => {
+                        for control in &controls {
+                            if !control.is_suspended() { control.request_sync(); }
+                        }
+                    }
+                    TrayCommand::Suspend | TrayCommand::SuspendAll => {
+                        for control in &controls { control.set_suspended(true); }
+                    }
+                    TrayCommand::Resume | TrayCommand::ResumeAll => {
+                        for control in &controls {
+                            control.set_suspended(false);
+                            control.request_sync();
+                        }
+                    }
+                    TrayCommand::SyncRepository(path) => {
+                        if let Some(control) = controls.iter().find(|control| control.repo_path() == path) {
+                            if !control.is_suspended() { control.request_sync(); }
+                        }
+                    }
+                    TrayCommand::SuspendRepository(path) => {
+                        if let Some(control) = controls.iter().find(|control| control.repo_path() == path) {
+                            control.set_suspended(true);
+                        }
+                    }
+                    TrayCommand::ResumeRepository(path) => {
+                        if let Some(control) = controls.iter().find(|control| control.repo_path() == path) {
+                            control.set_suspended(false);
+                            control.request_sync();
+                        }
+                    }
+                    TrayCommand::Quit => {
+                        for control in &controls { control.shutdown(); }
+                        if let Some(task) = spawn_task.take() { task.abort(); }
+                        if let Some(handle) = tray_handle { handle.shutdown().await; }
+                        return Ok(());
+                    }
+                    TrayCommand::Respawn { reason } => {
+                        warn!(%reason, "Aggregate tray respawn requested");
+                        if let Some(task) = spawn_task.take() { task.abort(); }
+                        if let Some(handle) = tray_handle.take() { handle.shutdown().await; }
+                        last_render_signature = None;
+                        next_attempt = time::Instant::now() + TRAY_RETRY_SOON_DELAY;
+                    }
+                }
+            }
+        }
+    }
+}
 
 /// Watch mode configuration
 #[derive(Debug, Clone)]
@@ -90,6 +211,104 @@ pub struct WatchManager {
     sync_state_change_tx: tokio_watch::Sender<u64>,
     #[cfg(feature = "tray")]
     sync_state_change_seq: Arc<AtomicU64>,
+    #[cfg(feature = "tray")]
+    manual_sync_requested: Arc<AtomicBool>,
+    #[cfg(feature = "tray")]
+    shutdown_requested: Arc<AtomicBool>,
+    #[cfg(feature = "tray")]
+    watch_started: Arc<AtomicBool>,
+    #[cfg(feature = "tray")]
+    suspension_store: Option<SuspensionStore>,
+}
+
+#[cfg(feature = "tray")]
+#[derive(Clone)]
+pub struct WatchControl {
+    repo_path: PathBuf,
+    display_name: Option<String>,
+    is_syncing: Arc<AtomicBool>,
+    sync_suspended: Arc<AtomicBool>,
+    last_successful_sync_unix_secs: Arc<AtomicI64>,
+    last_sync_error: Arc<RwLock<Option<String>>>,
+    manual_sync_requested: Arc<AtomicBool>,
+    shutdown_requested: Arc<AtomicBool>,
+    watch_started: Arc<AtomicBool>,
+    sync_state_change_tx: tokio_watch::Sender<u64>,
+    sync_state_change_seq: Arc<AtomicU64>,
+    suspension_store: Option<SuspensionStore>,
+}
+
+#[cfg(feature = "tray")]
+impl WatchControl {
+    pub fn repo_path(&self) -> &Path {
+        &self.repo_path
+    }
+
+    pub fn request_sync(&self) {
+        self.manual_sync_requested.store(true, Ordering::Release);
+        self.notify_changed();
+    }
+
+    pub fn set_suspended(&self, suspended: bool) {
+        if let Some(store) = &self.suspension_store {
+            if let Err(error) = store.set_suspended(&self.repo_path, suspended) {
+                warn!(
+                    repo = %self.repo_path.display(),
+                    %error,
+                    "Unable to persist repository suspension state"
+                );
+            }
+        }
+        self.sync_suspended.store(suspended, Ordering::Release);
+        self.notify_changed();
+    }
+
+    pub fn is_suspended(&self) -> bool {
+        self.sync_suspended.load(Ordering::Acquire)
+    }
+
+    pub fn shutdown(&self) {
+        self.shutdown_requested.store(true, Ordering::Release);
+        self.notify_changed();
+    }
+
+    pub fn is_shutdown_requested(&self) -> bool {
+        self.shutdown_requested.load(Ordering::Acquire)
+    }
+
+    pub async fn set_watch_error(&self, error: String) {
+        *self.last_sync_error.write().await = Some(error);
+        self.watch_started.store(false, Ordering::Release);
+        self.notify_changed();
+    }
+
+    pub async fn snapshot(&self) -> TrayState {
+        let mut state = TrayState::new(self.repo_path.clone());
+        state.display_name = self.display_name.clone();
+        state.paused = self.sync_suspended.load(Ordering::Acquire);
+        state.last_error = self.last_sync_error.read().await.clone();
+        state.status = if !self.watch_started.load(Ordering::Acquire) && state.last_error.is_none()
+        {
+            TrayStatus::Starting
+        } else if self.is_syncing.load(Ordering::Acquire) {
+            TrayStatus::Syncing
+        } else if let Some(error) = &state.last_error {
+            TrayStatus::Error(error.clone())
+        } else {
+            TrayStatus::Idle
+        };
+        let unix_secs = self.last_successful_sync_unix_secs.load(Ordering::Acquire);
+        if unix_secs > 0 {
+            use chrono::TimeZone;
+            state.last_sync = chrono::Local.timestamp_opt(unix_secs, 0).single();
+        }
+        state
+    }
+
+    fn notify_changed(&self) {
+        let seq = self.sync_state_change_seq.fetch_add(1, Ordering::AcqRel) + 1;
+        let _ = self.sync_state_change_tx.send(seq);
+    }
 }
 
 /// Event handler for file system changes
@@ -157,18 +376,70 @@ impl WatchManager {
             sync_state_change_tx,
             #[cfg(feature = "tray")]
             sync_state_change_seq: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "tray")]
+            manual_sync_requested: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "tray")]
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "tray")]
+            watch_started: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "tray")]
+            suspension_store: None,
+        }
+    }
+
+    #[cfg(feature = "tray")]
+    pub fn with_suspension_store(mut self, store: SuspensionStore) -> Self {
+        self.sync_suspended.store(
+            store.is_suspended(Path::new(&self.repo_path)),
+            Ordering::Release,
+        );
+        self.suspension_store = Some(store);
+        self
+    }
+
+    #[cfg(feature = "tray")]
+    pub fn control(&self) -> WatchControl {
+        self.control_named(None)
+    }
+
+    #[cfg(feature = "tray")]
+    pub fn control_named(&self, display_name: Option<String>) -> WatchControl {
+        WatchControl {
+            repo_path: PathBuf::from(&self.repo_path),
+            display_name,
+            is_syncing: self.is_syncing.clone(),
+            sync_suspended: self.sync_suspended.clone(),
+            last_successful_sync_unix_secs: self.last_successful_sync_unix_secs.clone(),
+            last_sync_error: self.last_sync_error.clone(),
+            manual_sync_requested: self.manual_sync_requested.clone(),
+            shutdown_requested: self.shutdown_requested.clone(),
+            watch_started: self.watch_started.clone(),
+            suspension_store: self.suspension_store.clone(),
+            sync_state_change_tx: self.sync_state_change_tx.clone(),
+            sync_state_change_seq: self.sync_state_change_seq.clone(),
         }
     }
 
     /// Start watching for changes
     pub async fn watch(&self) -> Result<()> {
         info!("Starting watch mode for: {}", self.repo_path);
+        #[cfg(feature = "tray")]
+        {
+            self.watch_started.store(false, Ordering::Release);
+            self.notify_sync_state_changed();
+        }
 
         // Create channel for file events
         let (tx, rx) = mpsc::channel::<Event>(100);
 
         // Setup file watcher
         let _watcher = self.setup_watcher(tx)?;
+        #[cfg(feature = "tray")]
+        {
+            self.watch_started.store(true, Ordering::Release);
+            *self.last_sync_error.write().await = None;
+            self.notify_sync_state_changed();
+        }
 
         info!(
             "Watching for changes (debounce: {}s)",
@@ -319,17 +590,26 @@ impl WatchManager {
             tokio::select! {
                 biased;
                 _ = interval.tick() => {
-                    if !paused {
+                    #[cfg(feature = "tray")]
+                    if self.shutdown_requested.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    #[cfg(feature = "tray")]
+                    if self.manual_sync_requested.swap(false, Ordering::AcqRel) {
+                        sync_state.request_sync_now();
+                    }
+                    let suspended = paused || self.is_sync_suspended();
+                    if !suspended {
                         self.handle_timeout(sync_state).await;
                     }
                 }
                 Some(event) = rx.recv() => {
-                    if !paused {
+                    if !paused && !self.is_sync_suspended() {
                         self.handle_file_event(event, sync_state);
                     }
                 }
                 _ = Self::tick_optional_interval(periodic_interval) => {
-                    if !paused {
+                    if !paused && !self.is_sync_suspended() {
                         sync_state.request_sync_now();
                         self.handle_timeout(sync_state).await;
                     }
@@ -424,7 +704,9 @@ impl WatchManager {
                         ));
                     }
 
-                    self.handle_timeout_with_optional_tray(sync_state, &mut tray_state, &mut tray_handle).await;
+                    if !self.is_sync_suspended() {
+                        self.handle_timeout_with_optional_tray(sync_state, &mut tray_state, &mut tray_handle).await;
+                    }
                     self.reconcile_tray_state_from_global(&mut tray_state, &mut tray_handle)
                         .await;
                     self.refresh_tray_relative_time_display(
@@ -435,11 +717,15 @@ impl WatchManager {
                     .await;
                 }
                 Some(event) = rx.recv() => {
-                    self.handle_file_event(event, sync_state);
+                    if !self.is_sync_suspended() {
+                        self.handle_file_event(event, sync_state);
+                    }
                 }
                 _ = Self::tick_optional_interval(periodic_interval) => {
-                    sync_state.request_sync_now();
-                    self.handle_timeout_with_optional_tray(sync_state, &mut tray_state, &mut tray_handle).await;
+                    if !self.is_sync_suspended() {
+                        sync_state.request_sync_now();
+                        self.handle_timeout_with_optional_tray(sync_state, &mut tray_state, &mut tray_handle).await;
+                    }
                 }
                 Some(cmd) = cmd_rx.recv() => {
                     match cmd {
@@ -460,9 +746,41 @@ impl WatchManager {
                         TrayCommand::Resume => {
                             info!("Tray: resuming sync activity");
                             self.set_sync_suspended(false);
+                            sync_state.request_sync_now();
                             self.reconcile_tray_state_from_global(&mut tray_state, &mut tray_handle)
                                 .await;
                         }
+                        TrayCommand::SyncAll => {
+                            if !tray_state.paused {
+                                self.do_sync_with_optional_tray_update(sync_state, &mut tray_state, &mut tray_handle).await;
+                            }
+                        }
+                        TrayCommand::SuspendAll => {
+                            self.set_sync_suspended(true);
+                            self.reconcile_tray_state_from_global(&mut tray_state, &mut tray_handle).await;
+                        }
+                        TrayCommand::ResumeAll => {
+                            self.set_sync_suspended(false);
+                            sync_state.request_sync_now();
+                            self.reconcile_tray_state_from_global(&mut tray_state, &mut tray_handle).await;
+                        }
+                        TrayCommand::SyncRepository(path) if path == PathBuf::from(&self.repo_path) => {
+                            if !tray_state.paused {
+                                self.do_sync_with_optional_tray_update(sync_state, &mut tray_state, &mut tray_handle).await;
+                            }
+                        }
+                        TrayCommand::SuspendRepository(path) if path == PathBuf::from(&self.repo_path) => {
+                            self.set_sync_suspended(true);
+                            self.reconcile_tray_state_from_global(&mut tray_state, &mut tray_handle).await;
+                        }
+                        TrayCommand::ResumeRepository(path) if path == PathBuf::from(&self.repo_path) => {
+                            self.set_sync_suspended(false);
+                            sync_state.request_sync_now();
+                            self.reconcile_tray_state_from_global(&mut tray_state, &mut tray_handle).await;
+                        }
+                        TrayCommand::SyncRepository(_)
+                        | TrayCommand::SuspendRepository(_)
+                        | TrayCommand::ResumeRepository(_) => {}
                         TrayCommand::Quit => {
                             info!("Tray: quit requested");
                             if let Some(handle) = &tray_handle {
@@ -674,7 +992,7 @@ impl WatchManager {
         let state = tray_state.clone();
         let update_result = handle
             .update(move |t: &mut GitSyncTray| {
-                t.state = state;
+                t.state.update_repository(state);
                 t.bump_icon_generation();
             })
             .await;
@@ -1003,6 +1321,11 @@ impl WatchManager {
 
     #[cfg(feature = "tray")]
     fn set_sync_suspended(&self, suspended: bool) {
+        if let Some(store) = &self.suspension_store {
+            if let Err(error) = store.set_suspended(Path::new(&self.repo_path), suspended) {
+                warn!(repo = %self.repo_path, %error, "Unable to persist repository suspension state");
+            }
+        }
         self.sync_suspended.store(suspended, Ordering::Release);
         self.notify_sync_state_changed();
     }
@@ -1177,7 +1500,22 @@ pub async fn watch_with_periodic_sync(
     sync_interval_ms: Option<u64>,
 ) -> Result<()> {
     watch_config.periodic_sync_interval_ms = sync_interval_ms;
+    let enable_tray = watch_config.enable_tray;
     let manager = WatchManager::new(repo_path, sync_config, watch_config);
+    #[cfg(feature = "tray")]
+    let manager = if enable_tray {
+        match SuspensionStore::load_default() {
+            Ok(store) => manager.with_suspension_store(store),
+            Err(error) => {
+                warn!(%error, "Unable to load persistent suspension state; continuing with in-memory state");
+                manager
+            }
+        }
+    } else {
+        manager
+    };
+    #[cfg(not(feature = "tray"))]
+    let _ = enable_tray;
     manager.watch().await
 }
 
@@ -1425,5 +1763,41 @@ mod tests {
             0
         );
         assert!(!manager.is_syncing.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn aggregate_control_reports_named_repository_state_and_accepts_commands() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let repo_path = temp.path().join("repo");
+        let state_path = temp.path().join("state.toml");
+        let store = crate::runtime_state::SuspensionStore::load(state_path.clone())
+            .expect("load suspension state");
+        store
+            .set_suspended(&repo_path, true)
+            .expect("persist initial suspension");
+        let manager = WatchManager::new(&repo_path, SyncConfig::default(), WatchConfig::default())
+            .with_suspension_store(store);
+        let control = manager.control_named(Some("notes".into()));
+
+        let starting = control.snapshot().await;
+        assert_eq!(starting.repo_name(), "notes");
+        assert_eq!(starting.status, crate::tray::TrayStatus::Starting);
+        assert!(starting.paused);
+
+        control.set_suspended(false);
+        control.request_sync();
+        let resumed = control.snapshot().await;
+        assert!(!resumed.paused);
+        assert!(manager.manual_sync_requested.load(Ordering::Acquire));
+        let reloaded = crate::runtime_state::SuspensionStore::load(state_path)
+            .expect("reload suspension state");
+        assert!(!reloaded.is_suspended(&repo_path));
+
+        control.set_watch_error("watch failed".into()).await;
+        let failed = control.snapshot().await;
+        assert_eq!(
+            failed.status,
+            crate::tray::TrayStatus::Error("watch failed".into())
+        );
     }
 }

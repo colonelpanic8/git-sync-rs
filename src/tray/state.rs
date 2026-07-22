@@ -1,9 +1,11 @@
 use chrono::{DateTime, Local};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrayState {
     pub repo_path: PathBuf,
+    pub display_name: Option<String>,
     pub status: TrayStatus,
     pub last_sync: Option<DateTime<Local>>,
     pub last_error: Option<String>,
@@ -12,6 +14,7 @@ pub struct TrayState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrayStatus {
+    Starting,
     Idle,
     Syncing,
     Error(String),
@@ -22,6 +25,12 @@ pub enum TrayCommand {
     SyncNow,
     Suspend,
     Resume,
+    SyncAll,
+    SuspendAll,
+    ResumeAll,
+    SyncRepository(PathBuf),
+    SuspendRepository(PathBuf),
+    ResumeRepository(PathBuf),
     Quit,
     /// Internal command: request the tray service be restarted.
     ///
@@ -37,7 +46,8 @@ impl TrayState {
     pub fn new(repo_path: PathBuf) -> Self {
         Self {
             repo_path,
-            status: TrayStatus::Idle,
+            display_name: None,
+            status: TrayStatus::Starting,
             last_sync: None,
             last_error: None,
             paused: false,
@@ -49,6 +59,7 @@ impl TrayState {
             return "Suspended".to_string();
         }
         match &self.status {
+            TrayStatus::Starting => "Starting...".to_string(),
             TrayStatus::Idle => "Idle".to_string(),
             TrayStatus::Syncing => "Syncing...".to_string(),
             TrayStatus::Error(msg) => format!("Error: {msg}"),
@@ -85,6 +96,9 @@ impl TrayState {
     }
 
     pub fn repo_name(&self) -> String {
+        if let Some(name) = &self.display_name {
+            return name.clone();
+        }
         self.repo_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -92,9 +106,97 @@ impl TrayState {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AggregateTrayState {
+    pub repositories: BTreeMap<PathBuf, TrayState>,
+}
+
+impl AggregateTrayState {
+    pub fn single(state: TrayState) -> Self {
+        let mut repositories = BTreeMap::new();
+        repositories.insert(state.repo_path.clone(), state);
+        Self { repositories }
+    }
+
+    pub fn update_repository(&mut self, state: TrayState) {
+        self.repositories.insert(state.repo_path.clone(), state);
+    }
+
+    pub fn aggregate_status(&self) -> TrayStatus {
+        if let Some(error) = self.repositories.values().find_map(|state| {
+            if let TrayStatus::Error(message) = &state.status {
+                Some(message.clone())
+            } else {
+                None
+            }
+        }) {
+            return TrayStatus::Error(error);
+        }
+        if self
+            .repositories
+            .values()
+            .any(|state| state.status == TrayStatus::Syncing)
+        {
+            return TrayStatus::Syncing;
+        }
+        if self
+            .repositories
+            .values()
+            .any(|state| state.status == TrayStatus::Starting)
+        {
+            return TrayStatus::Starting;
+        }
+        TrayStatus::Idle
+    }
+
+    pub fn any_paused(&self) -> bool {
+        self.repositories.values().any(|state| state.paused)
+    }
+
+    pub fn status_summary(&self) -> String {
+        let mut starting = 0;
+        let mut idle = 0;
+        let mut syncing = 0;
+        let mut suspended = 0;
+        let mut errors = 0;
+        for state in self.repositories.values() {
+            if state.paused {
+                suspended += 1;
+            }
+            match state.status {
+                TrayStatus::Starting if !state.paused => starting += 1,
+                TrayStatus::Idle if !state.paused => idle += 1,
+                TrayStatus::Syncing => syncing += 1,
+                TrayStatus::Error(_) => errors += 1,
+                TrayStatus::Starting | TrayStatus::Idle => {}
+            }
+        }
+        format!(
+            "{} repositories: {idle} idle, {syncing} syncing, {starting} starting, {suspended} suspended, {errors} error(s)",
+            self.repositories.len()
+        )
+    }
+
+    pub fn render_signature(&self) -> String {
+        self.repositories
+            .values()
+            .map(|state| {
+                format!(
+                    "{}\u{1f}{}\u{1f}{}\u{1f}{:?}",
+                    state.repo_name(),
+                    state.status_text(),
+                    state.last_sync_text(),
+                    state.last_error
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\u{1e}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::TrayState;
+    use super::{AggregateTrayState, TrayState, TrayStatus};
     use chrono::Local;
     use std::path::PathBuf;
 
@@ -126,5 +228,22 @@ mod tests {
         assert!(
             TrayState::relative_time_text(&(now - chrono::Duration::days(4))).ends_with("d ago")
         );
+    }
+
+    #[test]
+    fn aggregate_status_prioritizes_errors_then_syncing() {
+        let mut state = AggregateTrayState::default();
+        let mut idle = TrayState::new(PathBuf::from("/tmp/idle"));
+        idle.status = TrayStatus::Idle;
+        state.update_repository(idle);
+        let mut syncing = TrayState::new(PathBuf::from("/tmp/syncing"));
+        syncing.status = TrayStatus::Syncing;
+        state.update_repository(syncing);
+        assert_eq!(state.aggregate_status(), TrayStatus::Syncing);
+
+        let mut error = TrayState::new(PathBuf::from("/tmp/error"));
+        error.status = TrayStatus::Error("boom".into());
+        state.update_repository(error);
+        assert_eq!(state.aggregate_status(), TrayStatus::Error("boom".into()));
     }
 }

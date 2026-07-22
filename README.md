@@ -126,10 +126,16 @@ remote = "origin"
 conflict_branch = false
 
 [[repositories]]
+name = "my-notes"
 path = "~/my-notes"
+uri = "git@example.com:user/my-notes.git"
 branch = "main"
 watch = true
 interval = 30
+debounce = 0.5
+min_interval = 5
+initial_sync = false
+watch_paths = ["notes", "index.md"]
 
 [[repositories]]
 path = "~/my-docs"
@@ -142,6 +148,14 @@ When no repository path is passed:
 - `git-sync-rs watch` (and default watch mode) runs all repositories with `watch = true` in `[[repositories]]`.
 - If no repo has `watch = true`, watch mode runs all configured repositories.
 - `git-sync-rs check` and `git-sync-rs sync` run across all configured repositories.
+
+When tray support is enabled, multi-repository watch mode exposes one aggregate
+tray icon. Its menu shows every repository's current state, last successful sync,
+and latest error, with per-repository and global sync/suspend controls.
+Suspension survives service and machine restarts. It is operational state rather
+than declarative configuration and is stored in
+`$XDG_STATE_HOME/git-sync-rs/state.toml` (normally
+`~/.local/state/git-sync-rs/state.toml` on Linux).
 
 ## Command Line Options
 

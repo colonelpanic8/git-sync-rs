@@ -37,6 +37,15 @@ pub struct DefaultConfig {
     /// When true, create a fallback branch on merge conflicts instead of failing
     #[serde(default)]
     pub conflict_branch: bool,
+
+    #[serde(default = "default_watch_debounce")]
+    pub debounce: f64,
+
+    #[serde(default = "default_watch_min_interval")]
+    pub min_interval: f64,
+
+    #[serde(default = "default_initial_sync")]
+    pub initial_sync: bool,
 }
 
 impl Default for DefaultConfig {
@@ -48,14 +57,24 @@ impl Default for DefaultConfig {
             commit_message: default_commit_message(),
             remote: default_remote(),
             conflict_branch: false,
+            debounce: default_watch_debounce(),
+            min_interval: default_watch_min_interval(),
+            initial_sync: default_initial_sync(),
         }
     }
 }
 
 /// Repository-specific configuration
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct RepositoryConfig {
+    #[serde(default)]
+    pub name: Option<String>,
+
     pub path: PathBuf,
+
+    /// Repository URL used to clone the checkout when `path` does not exist.
+    #[serde(default)]
+    pub uri: Option<String>,
 
     #[serde(default)]
     pub sync_new_files: Option<bool>,
@@ -78,6 +97,18 @@ pub struct RepositoryConfig {
     #[serde(default)]
     pub interval: Option<u64>, // seconds
 
+    #[serde(default)]
+    pub debounce: Option<f64>,
+
+    #[serde(default)]
+    pub min_interval: Option<f64>,
+
+    #[serde(default)]
+    pub initial_sync: Option<bool>,
+
+    #[serde(default)]
+    pub watch_paths: Vec<PathBuf>,
+
     /// When true, create a fallback branch on merge conflicts instead of failing
     #[serde(default)]
     pub conflict_branch: Option<bool>,
@@ -98,6 +129,18 @@ fn default_commit_message() -> String {
 
 fn default_remote() -> String {
     "origin".to_string()
+}
+
+fn default_watch_debounce() -> f64 {
+    0.5
+}
+
+fn default_watch_min_interval() -> f64 {
+    1.0
+}
+
+fn default_initial_sync() -> bool {
+    true
 }
 
 /// Configuration loader that merges multiple sources with correct precedence
@@ -169,14 +212,7 @@ impl ConfigLoader {
                 // Create default config for this repo
                 RepositoryConfig {
                     path: repo_path.to_path_buf(),
-                    sync_new_files: None,
-                    skip_hooks: None,
-                    commit_message: None,
-                    remote: None,
-                    branch: None,
-                    watch: false,
-                    interval: None,
-                    conflict_branch: None,
+                    ..RepositoryConfig::default()
                 }
             });
 
@@ -294,14 +330,8 @@ impl ConfigLoader {
                 debug!("Adding repository from GIT_SYNC_DIRECTORY env: {:?}", path);
                 config.repositories.push(RepositoryConfig {
                     path,
-                    sync_new_files: None,
-                    skip_hooks: None,
-                    commit_message: None,
-                    remote: None,
-                    branch: None,
                     watch: true, // Assume watch mode when using env var
-                    interval: None,
-                    conflict_branch: None,
+                    ..RepositoryConfig::default()
                 });
             }
         }
@@ -336,14 +366,25 @@ remote = "origin"
 # It will automatically return to the target branch when possible.
 conflict_branch = false
 
+# File-watch behavior used when a repository does not override it
+debounce = 0.5
+min_interval = 1.0
+initial_sync = true
+
 # Example repository configurations
 [[repositories]]
+name = "notes"
 path = "/home/user/notes"
+uri = "git@example.com:user/notes.git"
 sync_new_files = true
 remote = "origin"
 branch = "main"
 watch = true
 interval = 30  # Override sync interval for this repo
+debounce = 1.0
+min_interval = 5.0
+initial_sync = false
+watch_paths = ["documents", "index.md"]
 conflict_branch = true  # Enable fallback branch for this repo
 
 [[repositories]]
@@ -353,4 +394,48 @@ watch = true
 # Uses defaults for other settings
 "#
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Config, DefaultConfig};
+    use std::path::PathBuf;
+
+    #[test]
+    fn parses_per_repository_watch_and_clone_settings() {
+        let config: Config = toml::from_str(
+            r#"
+                [[repositories]]
+                name = "history"
+                path = "/tmp/history"
+                uri = "git@example.com:history.git"
+                watch = true
+                interval = 300
+                debounce = 2.5
+                min_interval = 30.0
+                initial_sync = false
+                watch_paths = ["sessions", "history.jsonl"]
+            "#,
+        )
+        .expect("valid configuration");
+
+        let repo = &config.repositories[0];
+        assert_eq!(repo.name.as_deref(), Some("history"));
+        assert_eq!(repo.uri.as_deref(), Some("git@example.com:history.git"));
+        assert_eq!(repo.debounce, Some(2.5));
+        assert_eq!(repo.min_interval, Some(30.0));
+        assert_eq!(repo.initial_sync, Some(false));
+        assert_eq!(
+            repo.watch_paths,
+            vec![PathBuf::from("sessions"), PathBuf::from("history.jsonl")]
+        );
+    }
+
+    #[test]
+    fn watch_defaults_preserve_existing_cli_behavior() {
+        let defaults = DefaultConfig::default();
+        assert_eq!(defaults.debounce, 0.5);
+        assert_eq!(defaults.min_interval, 1.0);
+        assert!(defaults.initial_sync);
+    }
 }

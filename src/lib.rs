@@ -1,5 +1,7 @@
 pub mod config;
 pub mod error;
+#[cfg(feature = "tray")]
+pub mod runtime_state;
 pub mod sync;
 #[cfg(feature = "tray")]
 pub mod tray;
