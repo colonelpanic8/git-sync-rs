@@ -218,3 +218,79 @@ fn sync_uses_checked_out_branch_even_with_stale_config_branch_name() -> Result<(
 
     Ok(())
 }
+
+fn git_rev_parse(cwd: &std::path::Path, rev: &str) -> Result<String> {
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(["rev-parse", rev])
+        .output()?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git rev-parse {rev} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_string())
+}
+
+#[test]
+fn failed_fast_forward_checkout_must_not_advance_the_branch() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let setup = TestRepoSetup::new()?;
+    setup.commit_file("tracked.txt", "v1\n", "initial")?;
+    setup.push()?;
+
+    // Upstream adds a file inside a directory the local clone cannot write to.
+    let second_clone = setup.create_second_clone("second")?;
+    std::fs::create_dir_all(second_clone.join("locked"))?;
+    setup.commit_file_in(
+        &second_clone,
+        "locked/new.txt",
+        "upstream\n",
+        "add locked file",
+    )?;
+    setup.push_from(&second_clone)?;
+    let upstream_head = git_rev_parse(&second_clone, "HEAD")?;
+
+    let locked_dir = setup.local_path.join("locked");
+    std::fs::create_dir_all(&locked_dir)?;
+    std::fs::set_permissions(&locked_dir, std::fs::Permissions::from_mode(0o555))?;
+    if std::fs::write(locked_dir.join("probe"), "").is_ok() {
+        // Running as root: the permission trap cannot make the checkout fail.
+        return Ok(());
+    }
+
+    let before = git_rev_parse(&setup.local_path, "HEAD")?;
+    let sync_config = SyncConfig {
+        sync_new_files: true,
+        skip_hooks: false,
+        commit_message: Some("Sync".to_string()),
+        remote_name: "origin".to_string(),
+        branch_name: "master".to_string(),
+        conflict_branch: false,
+        target_branch: None,
+    };
+
+    let mut synchronizer =
+        RepositorySynchronizer::new_with_detected_branch(&setup.local_path, sync_config)?;
+    let result = synchronizer.sync(false);
+    std::fs::set_permissions(&locked_dir, std::fs::Permissions::from_mode(0o755))?;
+    assert!(
+        result.is_err(),
+        "checkout into a read-only directory should fail the sync"
+    );
+    assert_eq!(
+        git_rev_parse(&setup.local_path, "HEAD")?,
+        before,
+        "branch must not move when the checkout failed"
+    );
+
+    // Once the tree is writable again the next sync must fast-forward rather than
+    // auto-commit the stale tree as a revert of everything upstream added.
+    synchronizer.sync(false)?;
+    setup.assert_file_content("locked/new.txt", "upstream\n")?;
+    assert_eq!(git_rev_parse(&setup.local_path, "HEAD")?, upstream_head);
+
+    Ok(())
+}

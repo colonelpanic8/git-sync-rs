@@ -512,16 +512,19 @@ impl RepositorySynchronizer {
             .target()
             .ok_or_else(|| SyncError::Other("Could not get upstream OID".to_string()))?;
 
-        // Fast-forward by moving the reference
-        let mut reference = self.repo.head()?;
-        reference.set_target(upstream_oid, "fast-forward merge")?;
-
-        // Checkout the new HEAD to update working directory
+        // Update the working tree and index *before* moving the branch ref. If the
+        // checkout fails partway (ENOSPC, permissions, ...) the ref must stay where it
+        // was; otherwise the next cycle sees the stale tree as local changes and
+        // auto-commits a revert of everything upstream added.
         let object = self.repo.find_object(upstream_oid, None)?;
         let mut checkout_builder = git2::build::CheckoutBuilder::new();
         checkout_builder.force(); // Force update working directory files
         self.repo
             .checkout_tree(&object, Some(&mut checkout_builder))?;
+
+        // Fast-forward by moving the reference
+        let mut reference = self.repo.head()?;
+        reference.set_target(upstream_oid, "fast-forward merge")?;
 
         // Update HEAD to point to the new commit
         self.repo.set_head(&format!("refs/heads/{}", branch_name))?;
