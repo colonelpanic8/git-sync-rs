@@ -294,3 +294,42 @@ fn failed_fast_forward_checkout_must_not_advance_the_branch() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn rebase_skips_local_commit_already_applied_upstream() -> Result<()> {
+    let setup = TestRepoSetup::new()?;
+
+    setup.commit_file("data.txt", "v1\n", "initial")?;
+    setup.push()?;
+
+    let second = setup.create_second_clone("second")?;
+
+    // The same change lands on both sides as distinct commits.
+    setup.commit_file("data.txt", "v2\n", "local edit")?;
+    setup.commit_file_in(&second, "data.txt", "v2\n", "remote edit")?;
+    setup.push_from(&second)?;
+
+    let config = SyncConfig {
+        sync_new_files: true,
+        skip_hooks: false,
+        commit_message: Some("Sync".to_string()),
+        remote_name: "origin".to_string(),
+        branch_name: "master".to_string(),
+        conflict_branch: true,
+        target_branch: Some("master".to_string()),
+    };
+
+    let mut synchronizer =
+        RepositorySynchronizer::new_with_detected_branch(&setup.local_path, config)?;
+    synchronizer.sync(false)?;
+
+    assert_eq!(setup.get_current_branch()?, "master");
+    assert_eq!(
+        git_rev_parse(&setup.local_path, "HEAD")?,
+        git_rev_parse(&setup.local_path, "origin/master")?
+    );
+    assert_eq!(synchronizer.get_repository_state()?, RepositoryState::Clean);
+    setup.assert_file_content("data.txt", "v2\n")?;
+
+    Ok(())
+}
