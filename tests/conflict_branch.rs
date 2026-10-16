@@ -2,7 +2,7 @@ mod common;
 
 use anyhow::Result;
 use common::TestRepoSetup;
-use git_sync_rs::{RepositorySynchronizer, SyncConfig, FALLBACK_BRANCH_PREFIX};
+use git_sync_rs::{RepositoryState, RepositorySynchronizer, SyncConfig, FALLBACK_BRANCH_PREFIX};
 use std::fs;
 use std::process::Command;
 
@@ -334,6 +334,64 @@ fn conflict_branch_naming_includes_hostname() -> Result<()> {
         hostname,
         branch_suffix
     );
+
+    Ok(())
+}
+
+#[test]
+fn conflict_branch_returns_to_target_skipping_already_applied_commits() -> Result<()> {
+    let setup = TestRepoSetup::new()?;
+
+    setup.commit_file("data.txt", "line1\nline2\nline3\n", "Initial")?;
+    setup.push()?;
+
+    let second = setup.create_second_clone("second")?;
+
+    setup.commit_file("data.txt", "line1\nLOCAL\nline3\n", "Local change")?;
+    setup.commit_file_in(
+        &second,
+        "data.txt",
+        "line1\nREMOTE\nline3\n",
+        "Remote change",
+    )?;
+    setup.push_from(&second)?;
+
+    let config = SyncConfig {
+        sync_new_files: true,
+        skip_hooks: false,
+        commit_message: Some("Sync".to_string()),
+        remote_name: "origin".to_string(),
+        branch_name: "master".to_string(),
+        conflict_branch: true,
+        target_branch: Some("master".to_string()),
+    };
+
+    let mut sync =
+        RepositorySynchronizer::new_with_detected_branch(&setup.local_path, config.clone())?;
+    sync.sync(false)?;
+    assert!(get_current_branch(&setup.local_path)?.starts_with(FALLBACK_BRANCH_PREFIX));
+
+    setup.commit_file("notes.txt", "fallback-only\n", "Fallback-only change")?;
+
+    // Target independently adopts the conflicting fallback commit's content,
+    // so rebasing that commit onto it yields an empty commit.
+    setup.commit_file_in(
+        &second,
+        "data.txt",
+        "line1\nLOCAL\nline3\n",
+        "Adopt local change",
+    )?;
+    setup.push_from(&second)?;
+
+    let mut sync2 = RepositorySynchronizer::new_with_detected_branch(&setup.local_path, config)?;
+    sync2.sync(false)?;
+
+    assert_eq!(get_current_branch(&setup.local_path)?, "master");
+    assert_eq!(sync2.get_repository_state()?, RepositoryState::Clean);
+    setup.assert_file_content("data.txt", "line1\nLOCAL\nline3\n")?;
+
+    setup.pull_in(&second)?;
+    setup.assert_file_content_in(&second, "notes.txt", "fallback-only\n")?;
 
     Ok(())
 }

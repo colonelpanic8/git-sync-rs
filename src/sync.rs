@@ -567,27 +567,17 @@ impl RepositorySynchronizer {
             None,
         )?;
 
-        // Process each commit
-        while let Some(operation) = rebase.next() {
-            let _operation = operation?;
+        if !self.apply_rebase(&mut rebase, &sig)? {
+            warn!("Conflicts detected during rebase");
 
-            // Check if we can continue
-            if self.repo.index()?.has_conflicts() {
-                warn!("Conflicts detected during rebase");
-                rebase.abort()?;
-
-                // If conflict_branch is enabled, create a fallback branch
-                if self.config.conflict_branch {
-                    return self.handle_conflict_with_fallback();
-                }
-
-                return Err(SyncError::ManualInterventionRequired {
-                    reason: "Rebase conflicts detected. Please resolve manually.".to_string(),
-                });
+            // If conflict_branch is enabled, create a fallback branch
+            if self.config.conflict_branch {
+                return self.handle_conflict_with_fallback();
             }
 
-            // Continue with the rebase
-            rebase.commit(None, &sig, None)?;
+            return Err(SyncError::ManualInterventionRequired {
+                reason: "Rebase conflicts detected. Please resolve manually.".to_string(),
+            });
         }
 
         // Finish the rebase
@@ -603,6 +593,45 @@ impl RepositorySynchronizer {
 
         info!("Rebase completed successfully - working tree updated");
         Ok(())
+    }
+
+    /// Apply every operation of an in-progress rebase, skipping commits whose
+    /// changes are already upstream. Returns `Ok(false)` on conflicts. On
+    /// conflicts or errors the rebase is aborted, so it is never left in
+    /// progress with a detached HEAD.
+    fn apply_rebase(
+        &self,
+        rebase: &mut git2::Rebase<'_>,
+        sig: &git2::Signature<'_>,
+    ) -> Result<bool> {
+        let result = (|| -> Result<bool> {
+            while let Some(operation) = rebase.next() {
+                let operation = operation?;
+
+                if self.repo.index()?.has_conflicts() {
+                    return Ok(false);
+                }
+
+                match rebase.commit(None, sig, None) {
+                    Ok(_) => {}
+                    Err(e) if e.code() == git2::ErrorCode::Applied => {
+                        info!(
+                            "Skipping commit {} during rebase: already applied upstream",
+                            operation.id()
+                        );
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            Ok(true)
+        })();
+
+        if !matches!(result, Ok(true)) {
+            if let Err(e) = rebase.abort() {
+                warn!("Failed to abort rebase: {}", e);
+            }
+        }
+        result
     }
 
     /// Detect the repository's default branch
@@ -879,30 +908,32 @@ impl RepositorySynchronizer {
                 None,
             )?;
 
-            // Process each commit
-            while let Some(operation) = rebase.next() {
-                let _operation = operation?;
-
-                if self.repo.index()?.has_conflicts() {
-                    warn!("Conflicts during rebase back to target, aborting");
-                    rebase.abort()?;
-                    // Switch back to fallback branch
-                    self.repo.set_head(&fallback_ref)?;
-                    self.repo.checkout_head(Some(&mut checkout_builder))?;
-                    self.fallback_state.last_checked_target_oid = Some(target_oid);
-                    return Ok(false);
-                }
-
-                rebase.commit(None, &sig, None)?;
+            if !self.apply_rebase(&mut rebase, &sig)? {
+                warn!("Conflicts during rebase back to target, aborting");
+                // Switch back to fallback branch
+                self.repo.set_head(&fallback_ref)?;
+                self.repo.checkout_head(Some(&mut checkout_builder))?;
+                self.fallback_state.last_checked_target_oid = Some(target_oid);
+                return Ok(false);
             }
 
             rebase.finish(Some(&sig))?;
 
-            // Update working tree
-            let head = self.repo.head()?;
-            let head_commit = head.peel_to_commit()?;
-            self.repo
-                .checkout_tree(head_commit.as_object(), Some(&mut checkout_builder))?;
+            // finish() leaves HEAD on the rebased fallback branch; move the
+            // target branch there and switch to it.
+            let rebased_oid = self
+                .repo
+                .head()?
+                .target()
+                .ok_or_else(|| SyncError::Other("Rebased HEAD has no OID".to_string()))?;
+            self.repo.reference(
+                &target_ref,
+                rebased_oid,
+                true,
+                "git-sync: return to target branch",
+            )?;
+            self.repo.set_head(&target_ref)?;
+            self.repo.checkout_head(Some(&mut checkout_builder))?;
         }
 
         // Clear fallback state
