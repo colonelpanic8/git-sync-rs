@@ -48,6 +48,14 @@ fn load_icon_set(png_32: &[u8], png_48: &[u8], png_64: &[u8]) -> Vec<ksni::Icon>
     ]
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Overlay {
+    None,
+    Sync,
+    Error,
+    Pause,
+}
+
 /// Pre-decoded overlay icon sets for each status.
 struct OverlayIcons {
     sync: Vec<ksni::Icon>,
@@ -80,10 +88,12 @@ pub struct GitSyncTray {
     icons: Vec<ksni::Icon>,
     /// Decoded overlay icon pixmaps per status (computed once at startup).
     overlays: OverlayIcons,
-    /// Counter incremented on each state change to ensure ksni detects
-    /// overlay icon updates even if D-Bus property queries race with the
+    /// Counter incremented whenever the overlay changes to ensure ksni
+    /// detects the update even if a D-Bus property query races with the
     /// update signal processing.
     icon_generation: u64,
+    /// Overlay the current `icon_generation` was issued for.
+    generation_overlay: Overlay,
 }
 
 // OverlayIcons contains Vec<ksni::Icon> which is not Debug, so derive won't work.
@@ -134,6 +144,7 @@ impl GitSyncTray {
             _ => Vec::new(),
         };
 
+        let generation_overlay = Self::overlay_for(&state);
         Self {
             state,
             cmd_tx,
@@ -145,24 +156,38 @@ impl GitSyncTray {
                 pause: load_icon_set(OVERLAY_PAUSE_32, OVERLAY_PAUSE_48, OVERLAY_PAUSE_64),
             },
             icon_generation: 0,
+            generation_overlay,
         }
     }
 
-    /// Bump the icon generation counter to force ksni to emit a
-    /// NewOverlayIcon signal on the next update, even if a D-Bus property
-    /// query race would otherwise cause the change to go undetected.
+    /// Bump the icon generation counter if the overlay changed, forcing ksni
+    /// to emit NewOverlayIcon even if a D-Bus property query race would
+    /// otherwise cause the change to go undetected. Bumping on every state
+    /// change would make hosts reload the icon on each menu text refresh.
     pub fn bump_icon_generation(&mut self) {
+        let overlay = Self::overlay_for(&self.state);
+        if overlay == self.generation_overlay {
+            return;
+        }
+        self.generation_overlay = overlay;
         self.icon_generation = self.icon_generation.wrapping_add(1);
     }
 
+    fn overlay_for(state: &AggregateTrayState) -> Overlay {
+        match state.aggregate_status() {
+            TrayStatus::Error(_) => Overlay::Error,
+            TrayStatus::Syncing => Overlay::Sync,
+            TrayStatus::Starting | TrayStatus::Idle if state.any_paused() => Overlay::Pause,
+            TrayStatus::Starting | TrayStatus::Idle => Overlay::None,
+        }
+    }
+
     fn overlay_pixmaps_for_status(&self) -> Vec<ksni::Icon> {
-        let base = match self.state.aggregate_status() {
-            TrayStatus::Error(_) => &self.overlays.error,
-            TrayStatus::Syncing => &self.overlays.sync,
-            TrayStatus::Starting | TrayStatus::Idle if self.state.any_paused() => {
-                &self.overlays.pause
-            }
-            TrayStatus::Starting | TrayStatus::Idle => return self.generation_only_pixmap(),
+        let base = match Self::overlay_for(&self.state) {
+            Overlay::Error => &self.overlays.error,
+            Overlay::Sync => &self.overlays.sync,
+            Overlay::Pause => &self.overlays.pause,
+            Overlay::None => return self.generation_only_pixmap(),
         };
         let mut icons = base.clone();
         // Append a tiny unique pixmap so ksni's property-change detector
@@ -421,5 +446,30 @@ impl ksni::Tray for GitSyncTray {
         }
 
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GitSyncTray;
+    use crate::tray::{TrayState, TrayStatus};
+    use std::path::PathBuf;
+
+    #[test]
+    fn icon_generation_only_changes_with_overlay() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = TrayState::new(PathBuf::from("/tmp/repo"));
+        state.status = TrayStatus::Idle;
+        let mut tray = GitSyncTray::new(state.clone(), tx, None);
+
+        state.last_sync = Some(chrono::Local::now());
+        tray.state.update_repository(state.clone());
+        tray.bump_icon_generation();
+        assert_eq!(tray.icon_generation, 0);
+
+        state.status = TrayStatus::Syncing;
+        tray.state.update_repository(state);
+        tray.bump_icon_generation();
+        assert_eq!(tray.icon_generation, 1);
     }
 }
